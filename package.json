@@ -1,0 +1,43 @@
+{
+  "name": "whatsapp-group-summarizer-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot for summarizing group conversations using AI",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "node --watch src/bot.js",
+    "test": "node tests/test-summarizer.js",
+    "setup": "node setup.js",
+    "clear-sessions": "node scripts/clear-sessions.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "ai",
+    "summarizer",
+    "openrouter"
+  ],
+  "author": "Nitza",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "openai": "^4.68.4",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "sqlite3": "^5.1.7",
+    "winston": "^3.15.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "local"
+  }
+}
