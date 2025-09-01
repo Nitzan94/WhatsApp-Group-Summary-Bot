@@ -1,98 +1,106 @@
-# 🤖 WhatsApp Group Summary Bot
+# 🤖 WhatsApp AI Agent Bot
 
-בוט WhatsApp חכם שמאזין לקבוצות, שומר הודעות ומייצר סיכומים אוטומטיים באמצעות בינה מלאכותית.
+**Advanced WhatsApp Bot with Full AI Agent Capabilities**
 
-## ✨ תכונות עיקריות
+A sophisticated WhatsApp bot that captures comprehensive message history from WhatsApp Web and provides intelligent responses to natural language queries using Claude 3.5 Sonnet.
 
-- 📊 **מעקב אחר קבוצות WhatsApp** - שמירה אוטומטית של כל ההודעות
-- 🤖 **סיכומים חכמים** - יצירת סיכומים מובנים עם AI (Qwen 2.5 72B)
-- ⏰ **תזמון אוטומטי** - סיכומים מתוזמנים לקבוצות נבחרות
-- 🧹 **ניהול אוטומטי** - מחיקת הודעות ישנות וניקוי יומי
-- 📬 **איסוף היסטוריה** - יכולת לאסוף הודעות גם כשהבוט לא היה מחובר
-- 🎮 **פקודות מתקדמות** - ניהול מרחוק וחיפוש קבוצות
+## ✨ Key Features
 
-## 🚀 התקנה מהירה
+- 🤖 **Full AI Agent** - Natural conversation with Claude 3.5 Sonnet
+- 📊 **122 Active Groups** - Comprehensive WhatsApp monitoring  
+- 🔍 **75,000+ Messages** - Complete history synced from WhatsApp Web
+- 🛠️ **5 Smart Tools** - DatabaseAgentTools for advanced search
+- 📤 **Message Sending** - NEW! Send messages to groups via natural language (v4.3)
+- ⏰ **32 Scheduled Groups** - Automatic daily summaries
+- 📈 **Advanced Search** - FTS5 full-text search with date ranges
+- 🧹 **Auto Cleanup** - 72-hour message retention policy
 
-### 1. דרישות מערכת
+## 🚀 Quick Start
+
 ```bash
-# Node.js (גרסה 18 או חדשה יותר)
-node --version
-
-# Git
-git --version
-```
-
-### 2. הורדה והתקנה
-```bash
-# שכפול הפרויקט
-git clone https://github.com/Nitzan94/WhatsApp-Group-Summary-Bot.git
-cd WhatsApp-Group-Summary-Bot
-
-# התקנת תלותות
+# Clone and setup
+git clone <repository-url>
+cd botbot
 npm install
-```
 
-### 3. הגדרת API Key
-צור חשבון ב-[OpenRouter.ai](https://openrouter.ai) וקבל API key חינמי:
+# Configure environment
+cp .env.example .env
+# Edit .env with your API keys
 
-```bash
-# צור קובץ .env
-nano .env
-```
-
-הוסף את השורות הבאות:
-```bash
-# OpenRouter API Configuration
-OPENROUTER_API_KEY=sk-or-v1-YOUR-API-KEY-HERE
-OPENROUTER_MODEL=qwen/qwen-2.5-72b-instruct:free
-
-# Bot Configuration
-BOT_NAME=GroupSummaryBot
-MAX_MESSAGES_PER_SUMMARY=100
-SUMMARY_LANGUAGE=hebrew
-
-# Database Configuration
-DB_PATH=./data/messages.db
-
-# Logging Configuration
-LOG_LEVEL=info
-LOG_FILE=./logs/bot.log
-
-# WhatsApp Authentication (leave empty for QR code)
-PHONE_NUMBER=
-```
-
-### 4. הפעלת הבוט
-```bash
+# Run the bot
 node src/bot.js
 ```
 
-### 5. חיבור לWhatsApp
-- סרוק את קוד ה-QR שיופיע בטרמינל עם WhatsApp שלך
-- הבוט יתחבר אוטומטית ויתחיל לפעול
+## 🏗️ Architecture Overview
 
-## 📱 שימוש בסיסי
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   WhatsApp Web  │    │  ConversationHandler │    │ Claude 3.5 Sonnet │
+│   (122 Groups)  │───▶│    (AI Agent)     │───▶│  (OpenRouter)   │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+         │                        │                        │
+         ▼                        ▼                        ▼
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│ SQLite Database │    │ DatabaseAgentTools│    │   Tool Calls    │
+│  (75K+ Messages)│    │   (5 Smart Tools) │    │  (Search/Query) │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+```
 
-### פקודות זמינות בכל קבוצה
-- `!status` - מצב הבוט ומספר ההודעות
-- `!summary` - סיכום הודעות חדשות מאז הסיכום האחרון
-- `!today` - סיכום כל ההודעות מהיום (החל מ-00:00)
-- `!test` - בדיקת חיבור למערכת הAI
-- `!help` - רשימה מלאה של הפקודות
+## 🛠️ Technology Stack
 
-### פקודות מתקדמות (לקבוצת הניהול)
-- `!today [שם קבוצה]` - סיכום יומי לקבוצה אחרת
-- `!summary [שם קבוצה]` - סיכום לקבוצה אחרת
-- `!list` - רשימת כל הקבוצות
-- `!search [טקסט]` - חיפוש קבוצות
-- `!schedules` - רשימת תזמונים פעילים
-- `!schedule [קבוצה] [זמן]` - הגדרת תזמון
-- `!unschedule [קבוצה]` - ביטול תזמון
+- **Runtime:** Node.js 22.18.0
+- **WhatsApp:** Baileys library with messaging-history.set events
+- **AI:** Claude 3.5 Sonnet via OpenRouter API
+- **Database:** SQLite with FTS5 full-text search
+- **Scheduling:** node-cron for automated tasks
+- **Logging:** Winston with structured logging
 
-### דוגמה לשימוש
-1. שלח `!test` בקבוצה כדי לבדוק שהכל עובד
-2. שלח `!summary` לקבלת סיכום הודעות חדשות
-3. שלח `!today` לסיכום מלא של כל הודעות היום
+## 📱 Usage Examples
+
+### Natural Conversation (Any Group)
+```
+User: "מה דיברו השבוע על בינה מלאכותית?"
+Bot: [Searches AI-related messages from the week and provides summary]
+
+User: "תמצא לי הודעות מאתמול על השקעות"
+Bot: [Uses get_messages_by_date tool to find investment discussions]
+```
+
+### Command Interface  
+```bash
+!today                    # Today's summary
+!date 2025-08-30         # Specific date summary
+!date week               # Last week summary
+!status                  # Bot status and stats
+
+# NEW! Message sending (from authorized groups only)
+"שלח הודעה לקבוצת X: תוכן ההודעה"
+```
+
+### 📤 Message Sending Feature (v4.3)
+The bot can now send messages to groups through natural language:
+- **Authorized Groups:** "Nitzan bot" and "ניצן" groups only
+- **Smart Group Matching:** Exact name matching with fallback to partial search  
+- **Secure:** Permission validation and error handling
+- **Usage:** "שלח לקבוצת [שם] את [הודעה]" or similar natural phrasing
+
+## 😦 System Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| WhatsApp Connection | ✅ Active | 122 groups monitored |
+| AI Agent | ✅ Operational | Claude 3.5 Sonnet responding |
+| Database | ✅ Healthy | 75,000+ messages indexed |
+| Scheduled Tasks | ✅ Running | 32 groups with daily summaries |
+| Message Retention | ✅ Active | Auto-cleanup after 72 hours |
+
+## 📆 Documentation
+
+- [CLAUDE.md](./CLAUDE.md) - Complete technical guide for Claude Code
+- [ARCHITECTURE.md](./docs/ARCHITECTURE.md) - System architecture deep dive  
+- [API.md](./docs/API.md) - DatabaseAgentTools API reference
+- [DEPLOYMENT.md](./docs/DEPLOYMENT.md) - Production deployment guide
+- [CONTRIBUTING.md](./docs/CONTRIBUTING.md) - Development guidelines
 
 ## ⚙️ הגדרות מתקדמות
 
