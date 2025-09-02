@@ -31,7 +31,7 @@ node src/bot.js
 ```
 
 ### Step 3: Configure Your Management Group
-Replace the default group IDs with YOUR management group ID in these 2 locations:
+Replace the default group IDs with YOUR management group ID in these 3 locations:
 
 #### Location 1: `src/services/DatabaseAgentTools.js` (line ~756)
 ```javascript
@@ -56,14 +56,27 @@ this.summaryTargetGroupId = '972546262108-1556219067@g.us';
 this.summaryTargetGroupId = 'YOUR-GROUP-ID-HERE@g.us';
 ```
 
+#### Location 3: `src/bot.js` (line ~3106 - CRITICAL for AI conversations!)
+```javascript
+// Before:
+const conversationGroupId = '120363417758222119@g.us'; // Nitzan bot
+
+// After:
+const conversationGroupId = 'YOUR-GROUP-ID-HERE@g.us'; // Your management group
+```
+
+⚠️ **Without Location 3, the bot won't respond to natural questions - only to commands!**
+
 ## That's It! 🎉
 
 ### Test Your Setup
 1. Restart the bot: `node src/bot.js`
 2. In your management group, send: `!status`
-3. Try advanced commands: `!list`, `!today [group name]`
+3. Try natural conversation: "What happened today?"
+4. Try advanced commands: `!list`, `!today [group name]`
 
 ### What Your Management Group Can Do
+- ✅ Ask natural questions to AI (e.g., "What happened today?")
 - ✅ Send commands to other groups
 - ✅ Receive automatic summaries
 - ✅ Access all remote commands
@@ -71,19 +84,22 @@ this.summaryTargetGroupId = 'YOUR-GROUP-ID-HERE@g.us';
 
 ### Regular Groups Can
 - ✅ Use basic commands (!summary, !today, !status)
-- ✅ Ask natural questions (AI Agent)
+- ❌ Cannot ask natural questions (only management group can)
 - ❌ Cannot control other groups
 
 ## Troubleshooting
 
 ### "Command only available from Nitzan group"
-You're seeing the old group name. Make sure you replaced BOTH locations above.
+You're seeing the old group name. Make sure you replaced ALL 3 locations above.
 
 ### Groups not showing in !mygroups
 Wait a few seconds after connecting. The bot needs time to sync groups.
 
 ### Can't find summaryTargetGroupId
 Search for: `972546262108-1556219067@g.us` in src/bot.js
+
+### Bot doesn't respond to natural questions
+Make sure you updated Location 3 (`conversationGroupId`). Without it, the bot only responds to commands starting with `!`
 
 ## Advanced Configuration (Optional)
 

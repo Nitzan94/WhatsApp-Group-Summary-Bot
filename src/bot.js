@@ -449,7 +449,7 @@ class WhatsAppBot {
             if (!this.loggedGroups) this.loggedGroups = new Set();
             this.loggedGroups.add(groupId);
             
-            const groupInfo = await this.getGroupInfo(groupId);
+            const groupInfo = await this.db.getGroup(groupId);
             if (groupInfo) {
               console.log(`\n🆕 New group detected:`);
               console.log(`   Group Name: ${groupInfo.name}`);
@@ -3222,9 +3222,10 @@ ${analysisResult.analysis}
       response += `⚠️ *חשוב - הגדרות ראשוניות:*\n`;
       response += `1. בחר *קבוצת ניהול אחת* (כמו "Nitzan bot")\n`;
       response += `2. העתק את ה-ID שלה\n`;
-      response += `3. החלף את ה-ID בקבצים:\n`;
+      response += `3. החלף את ה-ID ב-*3 מקומות*:\n`;
       response += `   • src/services/DatabaseAgentTools.js (שורה 756)\n`;
-      response += `   • src/bot.js - חפש "summaryTargetGroupId"\n\n`;
+      response += `   • src/bot.js - חפש "summaryTargetGroupId"\n`;
+      response += `   • src/bot.js - שורה ~3106 "conversationGroupId" (לשיחות AI!)\n\n`;
       response += `💡 *הקבוצה הזו תוכל:*\n`;
       response += `• לשלוח פקודות לקבוצות אחרות\n`;
       response += `• לקבל סיכומים אוטומטיים\n`;
