@@ -7,13 +7,13 @@ A sophisticated WhatsApp bot that captures comprehensive message history from Wh
 ## ✨ Key Features
 
 - 🤖 **Full AI Agent** - Natural conversation with Claude 3.5 Sonnet
-- 📊 **122 Active Groups** - Comprehensive WhatsApp monitoring  
+- 📊 **122+ Active Groups** - Comprehensive WhatsApp monitoring  
 - 🔍 **75,000+ Messages** - Complete history synced from WhatsApp Web
 - 🛠️ **5 Smart Tools** - DatabaseAgentTools for advanced search
-- 📤 **Message Sending** - NEW! Send messages to groups via natural language (v4.3)
-- ⏰ **32 Scheduled Groups** - Automatic daily summaries
+- 📤 **Message Sending** - Send messages to groups via natural language (v4.3)
+- ⏰ **Scheduled Groups** - Automatic daily summaries
 - 📈 **Advanced Search** - FTS5 full-text search with date ranges
-- 🧹 **Auto Cleanup** - 72-hour message retention policy
+
 
 ## 🚀 Quick Start
 
@@ -36,7 +36,7 @@ node src/bot.js
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   WhatsApp Web  │    │  ConversationHandler │    │ Claude 3.5 Sonnet │
-│   (122 Groups)  │───▶│    (AI Agent)     │───▶│  (OpenRouter)   │
+│   (Groups)  │───▶│    (AI Agent)     │───▶│  (OpenRouter)   │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                        │                        │
          ▼                        ▼                        ▼
