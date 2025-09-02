@@ -4,6 +4,8 @@
  * Powered by Baileys - A lightweight WhatsApp Web API
  */
 
+console.log('🚀 Starting WhatsApp Bot...');
+
 const { 
   default: makeWASocket, 
   DisconnectReason, 
@@ -17,8 +19,8 @@ const path = require('path');
 const logger = require('./utils/logger');
 const config = require('../config/bot-config');
 const DatabaseManager = require('./database/DatabaseManager');
-const SummaryService = require('./services/SummaryService');
 const SchedulerService = require('./services/SchedulerService');
+const ConversationHandler = require('./services/ConversationHandler');
 
 class WhatsAppBot {
   constructor() {
@@ -33,9 +35,10 @@ class WhatsAppBot {
     this.sessionPath = path.join(__dirname, '../data/sessions');
     this.phoneNumber = process.env.PHONE_NUMBER || null; // For pairing code authentication
     this.db = new DatabaseManager();
-    this.summaryService = new SummaryService();
-    this.schedulerService = new SchedulerService(this, this.db);
+    this.conversationHandler = new ConversationHandler(this.db);
+    this.schedulerService = new SchedulerService(this, this.db, this.conversationHandler);
     this.summaryTargetGroupId = '972546262108-1556219067@g.us'; // קבוצת "ניצן"
+    this.isHistorySyncComplete = false; // Track if initial history sync is done
     
     // Ensure session directory exists
     if (!fs.existsSync(this.sessionPath)) {
@@ -62,12 +65,15 @@ class WhatsAppBot {
       // Initialize database
       await this.db.initialize();
       
-      // Clean old messages (older than 72 hours)
-      await this.db.cleanOldMessages(72);
-      
       // Initialize scheduler service
       await this.schedulerService.initialize();
       logger.info('⏰ מערכת תזמונים אותחלה');
+
+      // Initialize conversation handler
+      await this.conversationHandler.initialize();
+      // Set bot instance for message sending functionality
+      this.conversationHandler.setBotInstance(this);
+      logger.info('🤖 מערכת שיחה טבעית אותחלה');
       
       // Get latest Baileys version
       const { version } = await fetchLatestBaileysVersion();
@@ -94,7 +100,14 @@ class WhatsAppBot {
         printQRInTerminal: false, // We'll handle QR ourselves
         browser: config.baileys.browser,
         syncFullHistory: config.baileys.syncFullHistory,
-        markOnlineOnConnect: config.baileys.markOnlineOnConnect
+        markOnlineOnConnect: config.baileys.markOnlineOnConnect,
+        shouldSyncHistoryMessage: config.baileys.shouldSyncHistoryMessage,
+        defaultQueryTimeoutMs: config.baileys.defaultQueryTimeoutMs,
+        // Enhanced configuration for full history sync
+        emitOwnEvents: false,
+        generateHighQualityLinkPreview: false,
+        maxMsgRetryCount: 5,
+        msgRetryCounterMap: {}
       });
 
       // Handle authentication updates
@@ -113,6 +126,15 @@ class WhatsAppBot {
       // Handle groups updates
       this.socket.ev.on('groups.upsert', (groups) => {
         logger.info(`📊 עודכנו ${groups.length} קבוצות`);
+        
+        // Only show this tip for new users (first time setup)
+        if (groups.length > 0 && groups.length < 10) {
+          console.log('\n🎯 ========== SETUP TIP ==========');
+          console.log('To see all your groups and set up management group:');
+          console.log('Send !mygroups in any WhatsApp group');
+          console.log('==================================\n');
+        }
+        
         this.handleGroupsUpdate(groups);
       });
 
@@ -418,14 +440,60 @@ class WhatsAppBot {
         
         if (messageType === 'conversation' || messageType === 'extendedTextMessage') {
           const text = messageContent?.text || messageContent;
+          const groupId = message.key.remoteJid;
+          const senderId = message.key.participant || message.key.remoteJid;
+          const senderName = message.pushName || senderId.split('@')[0];
+          
+          // Only log group ID on first message from each group (for setup)
+          if (groupId.includes('@g.us') && !this.loggedGroups?.has(groupId)) {
+            if (!this.loggedGroups) this.loggedGroups = new Set();
+            this.loggedGroups.add(groupId);
+            
+            const groupInfo = await this.getGroupInfo(groupId);
+            if (groupInfo) {
+              console.log(`\n🆕 New group detected:`);
+              console.log(`   Group Name: ${groupInfo.name}`);
+              console.log(`   Group ID: ${groupId}`);
+              console.log(`   ────────────────────────`);
+            }
+          }
+          
           if (text?.startsWith('!')) {
+            // פקודות קיימות
             logger.info(`📝 פקודה התקבלה: ${text}`);
             await this.handleCommand(message, text);
+          } else if (this.isConversationGroup(groupId) && text && text.trim().length > 3) {
+            // שיחה טבעית בקבוצת ניצן
+            logger.info(`🗣️ שאלה טבעית מתקבלת: "${text.substring(0, 100)}..."`);
+            await this.handleNaturalConversation(message, text, groupId, senderId, senderName);
           }
         }
       } catch (error) {
         logger.error('Failed to process message:', error);
       }
+    }
+  }
+
+  /**
+   * Extract and save contact information from private message (without saving content)
+   */
+  async saveContactFromPrivateMessage(message) {
+    try {
+      const contactJid = message.key.remoteJid;
+      const contactName = message.pushName;
+      const phoneNumber = contactJid.split('@')[0];
+      
+      if (contactName && contactName.trim() && contactName !== phoneNumber) {
+        // Save only the contact info, not the message content
+        await this.db.saveContact({
+          name: contactName.trim(),
+          phone_number: contactJid
+        });
+        
+        logger.debug(`👤 נשמר איש קשר מהודעה פרטית: ${contactName}`);
+      }
+    } catch (error) {
+      logger.debug('Failed to save contact from private message:', error);
     }
   }
 
@@ -437,7 +505,13 @@ class WhatsAppBot {
     const messageId = message.key.id;
     const senderId = message.key.participant || message.key.remoteJid;
     
-    // Only process group messages
+    // Handle private messages - extract contact info only (no message content)
+    if (groupId?.endsWith('@s.whatsapp.net')) {
+      await this.saveContactFromPrivateMessage(message);
+      return; // Don't save the actual message content for privacy
+    }
+    
+    // Only process group messages for full message saving
     if (!groupId?.endsWith('@g.us')) return;
     
     // Extract message content
@@ -506,33 +580,269 @@ class WhatsAppBot {
     const { chats, contacts, messages, isLatest, progress, syncType } = historyUpdate;
     
     try {
+      logger.info(`📜 מעבד היסטוריה: ${syncType || 'unknown'}, התקדמות: ${progress || 0}%`);
+      
+      // Process contacts first
+      if (contacts && contacts.length > 0) {
+        logger.info(`👥 מעבד ${contacts.length} קשרים מההיסטוריה...`);
+        let contactsSaved = 0;
+        
+        for (const contact of contacts) {
+          try {
+            await this.processAndSaveContact(contact);
+            contactsSaved++;
+          } catch (error) {
+            logger.debug(`Failed to save contact: ${error.message}`);
+          }
+        }
+        
+        if (contactsSaved > 0) {
+          logger.info(`💾 נשמרו ${contactsSaved} קשרים`);
+        }
+      }
+      
+      // Process chats metadata
+      if (chats && chats.length > 0) {
+        logger.info(`💬 מעבד ${chats.length} צ'אטים מההיסטוריה...`);
+        let chatsSaved = 0;
+        
+        for (const chat of chats) {
+          try {
+            await this.processAndSaveChat(chat);
+            chatsSaved++;
+          } catch (error) {
+            logger.debug(`Failed to save chat: ${error.message}`);
+          }
+        }
+        
+        if (chatsSaved > 0) {
+          logger.info(`💾 נשמרו ${chatsSaved} צ'אטים`);
+        }
+      }
+      
+      // Process messages (with batch processing for better performance)
       if (messages && messages.length > 0) {
-        logger.info(`📜 קיבל ${messages.length} הודעות היסטוריות, התקדמות: ${progress || 0}%`);
+        logger.info(`📝 מעבד ${messages.length} הודעות היסטוריות...`);
         
         let savedCount = 0;
+        let groupMessages = [];
+        
+        // Filter and collect group messages for batch processing
         for (const message of messages) {
-          // Process only group messages
           if (message.key?.remoteJid?.includes('@g.us')) {
-            await this.saveMessage(message);
-            savedCount++;
+            groupMessages.push(message);
+          }
+        }
+        
+        // Process messages in batches of 50 for better performance
+        const batchSize = 50;
+        for (let i = 0; i < groupMessages.length; i += batchSize) {
+          const batch = groupMessages.slice(i, i + batchSize);
+          
+          try {
+            await this.processBatchMessages(batch);
+            savedCount += batch.length;
+            
+            // Log progress every 100 messages
+            if (savedCount % 100 === 0 || i + batchSize >= groupMessages.length) {
+              logger.info(`💾 נשמרו ${savedCount}/${groupMessages.length} הודעות היסטוריות`);
+            }
+          } catch (error) {
+            logger.error(`Failed to process message batch ${i}-${i + batchSize}:`, error);
           }
         }
         
         if (savedCount > 0) {
-          logger.info(`💾 נשמרו ${savedCount} הודעות היסטוריות מקבוצות`);
+          logger.info(`✅ סיים לשמור ${savedCount} הודעות היסטוריות מקבוצות`);
         }
         
-        if (isLatest) {
-          logger.info('✅ סיים לקבל היסטוריית הודעות');
-        }
+        // Update statistics
+        await this.updateHistoryStats(savedCount, syncType);
       }
       
-      if (chats && chats.length > 0) {
-        logger.debug(`📊 עודכנו ${chats.length} צ'אטים בהיסטוריה`);
+      if (isLatest) {
+        logger.info('🎉 סיים לקבל כל היסטוריית הודעות! הבוט מוכן לעבודה מלאה');
+        await this.onHistorySyncComplete();
       }
       
     } catch (error) {
       logger.error('Failed to handle message history:', error);
+    }
+  }
+
+  /**
+   * Process and save contact information from history
+   */
+  async processAndSaveContact(contact) {
+    try {
+      // Extract contact details
+      const contactId = contact.id;
+      const name = contact.name || contact.notify || contact.short;
+      const phoneNumber = contact.id?.replace('@s.whatsapp.net', '').replace('@c.us', '');
+      const isGroup = contactId?.includes('@g.us');
+      
+      if (!contactId) return;
+      
+      // Prepare contact data
+      const contactData = {
+        id: contactId,
+        name: name,
+        phoneNumber: phoneNumber,
+        isGroup: isGroup,
+        profilePictureUrl: contact.profilePictureUrl || null,
+        status: contact.status || null
+      };
+      
+      // Save contact to database using new DatabaseManager method
+      await this.db.upsertContact(contactData);
+      logger.debug(`📞 קשר נשמר: ${name || contactId}`);
+      
+    } catch (error) {
+      logger.error('Error processing contact:', error);
+    }
+  }
+
+  /**
+   * Process and save chat metadata from history
+   */
+  async processAndSaveChat(chat) {
+    try {
+      const chatId = chat.id;
+      const name = chat.name || chat.subject;
+      const isGroup = chatId?.includes('@g.us');
+      
+      if (!chatId || !name) return;
+      
+      // Determine chat type
+      const chatType = isGroup ? 'group' : 'private';
+      
+      // Prepare chat metadata
+      const chatData = {
+        id: chatId,
+        name: name,
+        chatType: chatType,
+        description: chat.desc || null,
+        participantCount: isGroup ? (chat.participants?.length || 0) : 0,
+        creationTime: chat.creation ? new Date(chat.creation * 1000).toISOString() : null,
+        isActive: !chat.archived,
+        lastActivity: chat.t ? new Date(chat.t * 1000).toISOString() : null,
+        archiveStatus: chat.archived || false,
+        pinned: chat.pin || false,
+        muted: chat.mute || false,
+        ownerId: isGroup ? chat.owner : null,
+        subjectChangedAt: chat.subjectTime ? new Date(chat.subjectTime * 1000).toISOString() : null,
+        subjectChangedBy: chat.subjectOwner || null
+      };
+      
+      // Save chat metadata to database
+      await this.db.upsertChatMetadata(chatData);
+      
+      // Also update groups table if it's a group
+      if (isGroup) {
+        await this.updateGroupMetadata(chat);
+      }
+      
+      logger.debug(`💬 מטא-דטה נשמר: ${name} (${chatType})`);
+      
+    } catch (error) {
+      logger.error('Error processing chat metadata:', error);
+    }
+  }
+
+  /**
+   * Process messages in batch for better performance
+   */
+  async processBatchMessages(messages) {
+    for (const message of messages) {
+      await this.processAndSaveMessage(message);
+    }
+  }
+
+  /**
+   * Update history sync statistics
+   */
+  async updateHistoryStats(messageCount, syncType) {
+    try {
+      // Update daily stats using new DatabaseManager method
+      await this.db.updateHistorySyncStats(messageCount);
+      
+      logger.debug(`📊 עדכן סטטיסטיקות: +${messageCount} הודעות (${syncType})`);
+    } catch (error) {
+      logger.error('Failed to update history stats:', error);
+    }
+  }
+
+  /**
+   * Called when full history sync is complete
+   */
+  async onHistorySyncComplete() {
+    try {
+      // Send notification to admin group about successful sync
+      if (this.summaryTargetGroupId) {
+        const totalMessages = await this.db.getAllQuery(
+          'SELECT COUNT(*) as count FROM messages'
+        );
+        
+        const totalGroups = await this.db.getAllQuery(
+          'SELECT COUNT(*) as count FROM groups WHERE is_active = 1'
+        );
+        
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `🎉 *סנכרון היסטוריה הושלם!*
+
+📊 *סטטיסטיקות:*
+• ${totalMessages[0]?.count || 0} הודעות סה"כ
+• ${totalGroups[0]?.count || 0} קבוצות פעילות
+• הבוט מוכן לעבודה מלאה עם גישה לכל ההיסטוריה!
+
+💡 עכשיו ניתן להשתמש בפקודות:
+• !history [תאריך] - סיכום מתאריך ספציפי
+• !search-history [מילות מפתח] - חיפוש בהיסטוריה
+• !ask [שאלה] - שאלות על כל התוכן ההיסטורי`
+        });
+      }
+      
+      // Set flag that initial sync is complete
+      this.isHistorySyncComplete = true;
+      
+    } catch (error) {
+      logger.error('Failed to handle history sync completion:', error);
+    }
+  }
+
+  /**
+   * Update group metadata from chat info
+   */
+  async updateGroupMetadata(chat) {
+    try {
+      const groupId = chat.id;
+      const name = chat.name || chat.subject;
+      
+      if (!groupId?.includes('@g.us')) return;
+      
+      // Check if group exists, if not create it
+      const existingGroup = await this.db.getGroup(groupId);
+      
+      if (!existingGroup) {
+        // Create new group entry
+        await this.db.runQuery(`
+          INSERT OR IGNORE INTO groups (id, name, is_active) 
+          VALUES (?, ?, 1)
+        `, [groupId, name]);
+        
+        logger.info(`➕ נוספה קבוצה חדשה מההיסטוריה: ${name}`);
+      } else if (existingGroup.name !== name) {
+        // Update group name if changed
+        await this.db.runQuery(`
+          UPDATE groups SET name = ?, updated_at = CURRENT_TIMESTAMP 
+          WHERE id = ?
+        `, [name, groupId]);
+        
+        logger.info(`📝 עודכן שם קבוצה: ${existingGroup.name} → ${name}`);
+      }
+      
+    } catch (error) {
+      logger.error(`Failed to update group metadata for ${chat.id}:`, error);
     }
   }
 
@@ -591,8 +901,10 @@ class WhatsAppBot {
     const groupId = message.key.remoteJid;
     
     try {
-      const cmd = command.toLowerCase().trim();
-      const args = command.split(' ').slice(1); // Get arguments after command
+      // Clean command text - remove brackets and extra spaces
+      const cleanCommand = command.replace(/\[|\]/g, '').trim();
+      const cmd = cleanCommand.toLowerCase().trim();
+      const args = cleanCommand.split(' ').slice(1); // Get arguments after command
       logger.info(`🔧 מטפל בפקודה: ${cmd} מקבוצה: ${groupId}`);
       
       // Check if this is a remote command from ניצן group
@@ -617,11 +929,49 @@ class WhatsAppBot {
           case '!unschedule':
             await this.handleRemoveSchedule(message, args);
             return;
+          case '!stats':
+            await this.handleRemoteStats(message, args.join(' '));
+            return;
+          case '!activity':
+            await this.handleRemoteActivity(message, args.join(' '));
+            return;
+          case '!ask':
+            await this.handleRemoteAsk(message, args.join(' '));
+            return;
+          case '!history':
+            // Handle remote history command
+            await this.handleHistoryCommand(message, args);
+            return;
+          case '!date':
+            // Handle remote date command
+            await this.handleDateCommand(message, args);
+            return;
+          case '!search-history':
+            // Handle remote search-history command
+            if (args.length > 0) {
+              await this.handleSearchHistory(message, args.join(' '));
+            } else {
+              await this.socket.sendMessage(groupId, {
+                text: '❓ נדרש טקסט לחיפוש. דוגמה: !search-history פיצה'
+              });
+            }
+            return;
+          case '!timeline':
+            // Handle remote timeline command
+            await this.handleTimelineCommand(message, args);
+            return;
+          case '!group-stats':
+            // Handle remote group-stats command
+            await this.handleGroupStats(message, args);
+            return;
         }
       }
       
       // Handle single-word commands (both local and from ניצן)
       switch (cmd) {
+        case '!mygroups':
+          await this.handleMyGroups(message);
+          break;
         case '!status':
           await this.sendStatusMessage(groupId);
           break;
@@ -635,7 +985,7 @@ class WhatsAppBot {
           await this.sendHelpMessage(groupId);
           break;
         case '!test':
-          await this.testSummaryService(groupId);
+          await this.testAIConnection(groupId);
           break;
         case '!list':
           if (isFromNitzanGroup) {
@@ -654,6 +1004,39 @@ class WhatsAppBot {
               text: '❌ פקודה זו זמינה רק מקבוצת ניצן'
             });
           }
+          break;
+        case '!stats':
+          await this.handleGroupStats(message);
+          break;
+        case '!activity':
+          await this.handleActivityAnalysis(message);
+          break;
+        case '!top-users':
+          await this.handleTopUsers(message);
+          break;
+        case '!ask':
+          await this.handleAskQuestion(message, args.join(' '));
+          break;
+        case '!history':
+          await this.handleHistoryCommand(message, args);
+          break;
+        case '!date':
+          await this.handleDateCommand(message, args);
+          break;
+        case '!search-history':
+          if (args.length > 0) {
+            await this.handleSearchHistory(message, args.join(' '));
+          } else {
+            await this.socket.sendMessage(groupId, {
+              text: '❓ נדרש טקסט לחיפוש. דוגמה: !search-history פיצה'
+            });
+          }
+          break;
+        case '!timeline':
+          await this.handleTimelineCommand(message, args);
+          break;
+        case '!group-stats':
+          await this.handleGroupStats(message);
           break;
         default:
           logger.debug(`❓ פקודה לא מוכרת: ${command}`);
@@ -696,6 +1079,23 @@ class WhatsAppBot {
 📝 *!summary* - סיכום הודעות חדשות (מאז סיכום אחרון)
 🗓️ *!today* - סיכום כל הודעות היום (מ-00:00)
 🧪 *!test* - בדיקת חיבור ל-AI
+🏠 *!mygroups* - רשימת כל הקבוצות שלך עם ה-IDs להגדרות
+
+🔍 *היסטוריה וחיפוש:*
+📜 *!history [תקופה]* - סיכום מתקופה (yesterday/week/month/YYYY-MM-DD)
+📅 *!date [תאריך/טווח]* - סיכום מתאריך או טווח (2025-08-29 או 2025-08-20 2025-08-22)
+🔍 *!search-history [טקסט]* - חיפוש בהיסטוריה
+📈 *!timeline [תקופה]* - ציר זמן פעילות
+📊 *!group-stats* - סטטיסטיקות מפורטות
+
+📈 *ניתוח וסטטיסטיקות:*
+📊 *!stats* - סטטיסטיקות קבוצה (7 ימים)
+📈 *!activity* - ניתוח פעילות לפי שעות וימים
+👥 *!top-users* - רשימת המשתמשים המובילים
+
+🤔 *שאלות על התוכן:*
+❓ *!ask [שאלה]* - שאל שאלות על תוכן הקבוצה
+
 ❓ *!help* - הודעה זו
 
 ✨ *כל הסיכומים נשלחים לקבוצת ניצן*`;
@@ -711,6 +1111,18 @@ class WhatsAppBot {
 🔍 *!search [חלק מהשם]* - חיפוש קבוצות
 ⏰ *!schedules* - רשימת כל התזמונים הפעילים
 
+🔍 *פקודות היסטוריה מרחוק:*
+📜 *!history [שם קבוצה] [תקופה]* - סיכום היסטורי של קבוצה
+📅 *!date [שם קבוצה] [תאריך/טווח]* - סיכום תאריך של קבוצה
+🔍 *!search-history [שם קבוצה] [טקסט]* - חיפוש בהיסטוריה של קבוצה
+📈 *!timeline [שם קבוצה] [תקופה]* - ציר זמן פעילות של קבוצה
+📊 *!group-stats [שם קבוצה]* - סטטיסטיקות מפורטות של קבוצה
+
+📈 *ניתוח מרחוק:*
+📊 *!stats [שם קבוצה]* - סטטיסטיקות עבור קבוצה אחרת
+📈 *!activity [שם קבוצה]* - ניתוח פעילות עבור קבוצה אחרת
+❓ *!ask [שם קבוצה] | [שאלה]* - שאל שאלה על תוכן קבוצה אחרת
+
 ⏱️ *תזמונים אוטומטיים:*
 📅 *!schedule [שם קבוצה] [זמן]* - הגדרת תזמון
 ❌ *!unschedule [שם קבוצה]* - ביטול תזמון
@@ -724,7 +1136,13 @@ class WhatsAppBot {
 💡 *דוגמאות סיכומים:*
 • !today AI TIPS
 • !summary הילדים שלי ואני
-• !search כושר`;
+• !search כושר
+
+💡 *דוגמאות ניתוח:*
+• !stats AI TIPS
+• !activity הילדים שלי ואני
+• !ask AI TIPS | מה הנושא המרכזי השבוע?
+• !ask הילדים שלי ואני | מי דיבר על חינוך?`;
       }
 
       
@@ -763,8 +1181,11 @@ class WhatsAppBot {
       
       logger.info(`📊 מייצר סיכום לקבוצת "${groupName}" (${messages.length} הודעות)`);
       
-      // Generate summary
-      const result = await this.summaryService.generateSummary(messages, groupName);
+      // Generate summary using AI Agent
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${groupName}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(
+        summaryQuery, null, 'system', false
+      );
       
       if (!result.success) {
         await this.socket.sendMessage(groupId, {
@@ -773,12 +1194,7 @@ class WhatsAppBot {
         return;
       }
       
-      // Format summary for WhatsApp
-      const formattedSummary = this.summaryService.formatSummaryForWhatsApp(
-        result.summary, 
-        groupName, 
-        result.metadata
-      );
+      const formattedSummary = result.response;
       
       // Send summary to the target group (ניצן)
       const summaryWithSource = `📊 *סיכום מקבוצת "${groupName}"*\n\n${formattedSummary}`;
@@ -875,7 +1291,8 @@ class WhatsAppBot {
       logger.info(`📊 מייצר סיכום יומי לקבוצת "${groupName}" (${messages.length} הודעות)`);
       
       // Generate summary
-      const result = await this.summaryService.generateSummary(messages, groupName);
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${groupName}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
       
       if (!result.success) {
         await this.socket.sendMessage(groupId, {
@@ -919,23 +1336,25 @@ class WhatsAppBot {
   }
 
   /**
-   * Test summary service
+   * Test AI connection
    */
-  async testSummaryService(groupId) {
+  async testAIConnection(groupId) {
     try {
       await this.socket.sendMessage(groupId, { 
         text: '🧪 בודק חיבור ל-AI...' 
       });
       
-      const result = await this.summaryService.testConnection();
+      const result = await this.conversationHandler.processNaturalQuery(
+        'בדיקה מהירה - אמור שלום', null, 'system', false
+      );
       
-      if (result.success) {
+      if (result && result.success) {
         await this.socket.sendMessage(groupId, {
-          text: `✅ חיבור לAPI תקין!\n💬 תגובה: "${result.message}"`
+          text: `✅ חיבור לAPI תקין!\n💬 תגובה: "${result.response}"`
         });
       } else {
         await this.socket.sendMessage(groupId, {
-          text: `❌ בעיה בחיבור לAPI:\n${result.error}`
+          text: `❌ בעיה בחיבור לAPI:\n${result?.error || 'שגיאה לא ידועה'}`
         });
       }
       
@@ -1067,7 +1486,8 @@ class WhatsAppBot {
       logger.info(`📊 מייצר סיכום יומי מרחוק לקבוצת "${targetGroup.name}" (${messages.length} הודעות)`);
       
       // Generate summary
-      const result = await this.summaryService.generateSummary(messages, targetGroup.name);
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${targetGroup.name}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
       
       if (!result.success) {
         await this.socket.sendMessage(this.summaryTargetGroupId, {
@@ -1154,7 +1574,8 @@ class WhatsAppBot {
       logger.info(`📊 מייצר סיכום חדש מרחוק לקבוצת "${targetGroup.name}" (${messages.length} הודעות)`);
       
       // Generate summary
-      const result = await this.summaryService.generateSummary(messages, targetGroup.name);
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${targetGroup.name}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
       
       if (!result.success) {
         await this.socket.sendMessage(this.summaryTargetGroupId, {
@@ -1164,11 +1585,7 @@ class WhatsAppBot {
       }
       
       // Format summary for WhatsApp
-      const formattedSummary = this.summaryService.formatSummaryForWhatsApp(
-        result.summary, 
-        `${targetGroup.name} (מרחוק)`, 
-        result.metadata
-      );
+      const formattedSummary = result.response;
       
       // Send summary to ניצן group
       await this.socket.sendMessage(this.summaryTargetGroupId, { text: formattedSummary });
@@ -1360,7 +1777,7 @@ class WhatsAppBot {
       }
 
       // Find the group
-      const groups = await this.searchGroups(groupName);
+      const groups = await this.searchGroupsByName(groupName);
       if (groups.length === 0) {
         await this.socket.sendMessage(this.summaryTargetGroupId, {
           text: `❌ לא נמצאה קבוצה המתאימה ל "${groupName}"\n\n💡 השתמש ב-!search כדי למצוא את השם המדויק`
@@ -1410,7 +1827,7 @@ class WhatsAppBot {
       const groupName = args.join(' ');
       
       // Find the group
-      const groups = await this.searchGroups(groupName);
+      const groups = await this.searchGroupsByName(groupName);
       if (groups.length === 0) {
         await this.socket.sendMessage(this.summaryTargetGroupId, {
           text: `❌ לא נמצאה קבוצה המתאימה ל "${groupName}"\n\n💡 השתמש ב-!search כדי למצוא את השם המדויק`
@@ -1435,6 +1852,517 @@ class WhatsAppBot {
       logger.error('Failed to remove schedule:', error);
       await this.socket.sendMessage(this.summaryTargetGroupId, {
         text: '❌ שגיאה בביטול תזמון'
+      });
+    }
+  }
+
+  /**
+   * Handle group statistics command
+   */
+  async handleGroupStats(message) {
+    const groupId = message.key.remoteJid;
+    
+    try {
+      await this.socket.sendMessage(groupId, {
+        text: '📊 מכין נתוני סטטיסטיקה... אנא המתן'
+      });
+
+      // Get 7-day statistics
+      const weekStats = await this.db.getGroupStats(groupId, 7);
+      const monthStats = await this.db.getGroupStats(groupId, 30);
+      const overview = await this.db.getGroupOverview(groupId);
+
+      if (!weekStats || weekStats.length === 0) {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ לא נמצאו נתונים סטטיסטיים עבור קבוצה זו'
+        });
+        return;
+      }
+
+      const groupName = overview.groupName || 'קבוצה זו';
+      
+      // Format weekly stats
+      const top5Week = weekStats.slice(0, 5);
+      const weeklyStatsText = top5Week.map((user, index) => {
+        const emoji = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][index];
+        return `${emoji} *${user.sender_name}*\n   💬 ${user.message_count} הודעות | 📏 אורך ממוצע: ${Math.round(user.avg_message_length)} תווים`;
+      }).join('\n');
+
+      // Format monthly comparison
+      const monthlyTotal = monthStats.reduce((sum, user) => sum + user.message_count, 0);
+      const weeklyTotal = weekStats.reduce((sum, user) => sum + user.message_count, 0);
+
+      const statsMessage = `📊 *סטטיסטיקות קבוצה - ${groupName}*
+
+🗓️ *נתוני השבוע (7 ימים אחרונים):*
+${weeklyStatsText}
+
+📈 *סיכום כללי:*
+• 💬 הודעות השבוע: ${weeklyTotal}
+• 📊 הודעות החודש: ${monthlyTotal}
+• 👥 משתתפים פעילים: ${weekStats.length}
+• 🏆 הכי פעיל השבוע: *${weekStats[0]?.sender_name || 'לא ידוע'}*
+
+⏰ *נוצר ב-${new Date().toLocaleString('he-IL')}*`;
+
+      await this.socket.sendMessage(groupId, { text: statsMessage });
+
+    } catch (error) {
+      logger.error('Failed to get group stats:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת נתונים סטטיסטיים. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle activity analysis command
+   */
+  async handleActivityAnalysis(message) {
+    const groupId = message.key.remoteJid;
+    
+    try {
+      await this.socket.sendMessage(groupId, {
+        text: '📈 מנתח פעילות קבוצה... אנא המתן'
+      });
+
+      const hourlyActivity = await this.db.getActivityByHour(groupId, 7);
+      const dailyActivity = await this.db.getActivityByDay(groupId, 7);
+      const overview = await this.db.getGroupOverview(groupId);
+
+      if (!hourlyActivity || hourlyActivity.length === 0) {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ לא נמצאו נתוני פעילות עבור קבוצה זו'
+        });
+        return;
+      }
+
+      const groupName = overview.groupName || 'קבוצה זו';
+
+      // Find peak hours (top 5)
+      const sortedHours = hourlyActivity.sort((a, b) => b.message_count - a.message_count);
+      const peakHours = sortedHours.slice(0, 5);
+      
+      const peakHoursText = peakHours.map((hour, index) => {
+        const emoji = ['🔥', '⚡', '✨', '💫', '⭐'][index];
+        const hourFormatted = hour.hour.toString().padStart(2, '0');
+        return `${emoji} ${hourFormatted}:00 - ${(parseInt(hourFormatted) + 1).toString().padStart(2, '0')}:00 (${hour.message_count} הודעות)`;
+      }).join('\n');
+
+      // Weekly activity summary
+      const weeklyTotals = dailyActivity.map(day => ({
+        day: day.day_name,
+        count: day.message_count
+      }));
+
+      const dailyText = weeklyTotals.map(day => 
+        `📅 ${day.day} - ${day.count} הודעות`
+      ).join('\n');
+
+      const activityMessage = `📈 *ניתוח פעילות - ${groupName}*
+
+🔥 *שעות השיא (7 ימים אחרונים):*
+${peakHoursText}
+
+📅 *פעילות לפי ימים:*
+${dailyText}
+
+📊 *תובנות:*
+• ⏰ שעת השיא: ${sortedHours[0]?.hour}:00
+• 📈 יום הכי פעיל: ${weeklyTotals.sort((a, b) => b.count - a.count)[0]?.day}
+• 💬 ממוצע הודעות יומי: ${Math.round(weeklyTotals.reduce((sum, day) => sum + day.count, 0) / weeklyTotals.length)}
+
+⏰ *נוצר ב-${new Date().toLocaleString('he-IL')}*`;
+
+      await this.socket.sendMessage(groupId, { text: activityMessage });
+
+    } catch (error) {
+      logger.error('Failed to analyze activity:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בניתוח פעילות. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle top users command
+   */
+  async handleTopUsers(message) {
+    const groupId = message.key.remoteJid;
+    
+    try {
+      await this.socket.sendMessage(groupId, {
+        text: '👥 מכין רשימת משתמשים מובילים... אנא המתן'
+      });
+
+      const topUsers = await this.db.getGroupStats(groupId, 30); // Last 30 days
+      const overview = await this.db.getGroupOverview(groupId);
+
+      if (!topUsers || topUsers.length === 0) {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ לא נמצאו נתונים עבור משתמשי הקבוצה'
+        });
+        return;
+      }
+
+      const groupName = overview.groupName || 'קבוצה זו';
+      const top10Users = topUsers.slice(0, 10);
+      
+      // Calculate total messages for percentages
+      const totalMessages = topUsers.reduce((sum, user) => sum + user.message_count, 0);
+
+      const topUsersText = top10Users.map((user, index) => {
+        const position = (index + 1).toString();
+        const percentage = ((user.message_count / totalMessages) * 100).toFixed(1);
+        
+        let emoji = '';
+        if (index === 0) emoji = '🥇';
+        else if (index === 1) emoji = '🥈';
+        else if (index === 2) emoji = '🥉';
+        else emoji = `${position}️⃣`;
+
+        const firstMessage = new Date(user.first_message).toLocaleDateString('he-IL');
+        const lastMessage = new Date(user.last_message).toLocaleDateString('he-IL');
+
+        return `${emoji} *${user.sender_name}*
+   💬 ${user.message_count} הודעות (${percentage}%)
+   📏 אורך ממוצע: ${Math.round(user.avg_message_length)} תווים
+   📅 מ-${firstMessage} עד ${lastMessage}`;
+      }).join('\n\n');
+
+      const topUsersMessage = `👥 *המשתמשים המובילים - ${groupName}*
+📊 *נתוני חודש אחרון*
+
+${topUsersText}
+
+📈 *סיכום:*
+• 💬 סה"כ הודעות: ${totalMessages.toLocaleString()}
+• 👥 משתתפים פעילים: ${topUsers.length}
+• 📊 ממוצע הודעות למשתמש: ${Math.round(totalMessages / topUsers.length)}
+
+⏰ *נוצר ב-${new Date().toLocaleString('he-IL')}*`;
+
+      await this.socket.sendMessage(groupId, { text: topUsersMessage });
+
+    } catch (error) {
+      logger.error('Failed to get top users:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת רשימת משתמשים מובילים. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle remote stats command (from management group)
+   */
+  async handleRemoteStats(message, groupName) {
+    try {
+      if (!groupName) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ שימוש שגוי בפקודה
+
+*שימוש נכון:*
+!stats [שם קבוצה]
+
+💡 *דוגמה:*
+• !stats AI TIPS`
+        });
+        return;
+      }
+
+      const groups = await this.searchGroupsByName(groupName);
+      if (groups.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאה קבוצה המתאימה ל "${groupName}"\n\n💡 השתמש ב-!search כדי למצוא את השם המדויק`
+        });
+        return;
+      }
+
+      const selectedGroup = groups[0];
+      
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: `📊 מכין סטטיסטיקות עבור "${selectedGroup.name}"...`
+      });
+
+      // Generate stats for the remote group
+      const weekStats = await this.db.getGroupStats(selectedGroup.id, 7);
+      const monthStats = await this.db.getGroupStats(selectedGroup.id, 30);
+
+      if (!weekStats || weekStats.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאו נתונים סטטיסטיים עבור "${selectedGroup.name}"`
+        });
+        return;
+      }
+
+      const top5Week = weekStats.slice(0, 5);
+      const weeklyStatsText = top5Week.map((user, index) => {
+        const emoji = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][index];
+        return `${emoji} *${user.sender_name}* - ${user.message_count} הודעות`;
+      }).join('\n');
+
+      const monthlyTotal = monthStats.reduce((sum, user) => sum + user.message_count, 0);
+      const weeklyTotal = weekStats.reduce((sum, user) => sum + user.message_count, 0);
+
+      const remoteStatsMessage = `📊 *סטטיסטיקות - ${selectedGroup.name}*
+
+🗓️ *נתוני השבוע:*
+${weeklyStatsText}
+
+📈 *סיכום:*
+• השבוע: ${weeklyTotal} הודעות
+• החודש: ${monthlyTotal} הודעות  
+• משתתפים פעילים: ${weekStats.length}
+
+⏰ ${new Date().toLocaleString('he-IL')}`;
+
+      await this.socket.sendMessage(this.summaryTargetGroupId, { text: remoteStatsMessage });
+
+    } catch (error) {
+      logger.error('Failed to get remote stats:', error);
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: '❌ שגיאה בקבלת סטטיסטיקות מרחוק'
+      });
+    }
+  }
+
+  /**
+   * Handle remote activity analysis command (from management group)
+   */
+  async handleRemoteActivity(message, groupName) {
+    try {
+      if (!groupName) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ שימוש שגוי בפקודה
+
+*שימוש נכון:*
+!activity [שם קבוצה]
+
+💡 *דוגמה:*
+• !activity AI TIPS`
+        });
+        return;
+      }
+
+      const groups = await this.searchGroupsByName(groupName);
+      if (groups.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאה קבוצה המתאימה ל "${groupName}"\n\n💡 השתמש ב-!search כדי למצוא את השם המדויק`
+        });
+        return;
+      }
+
+      const selectedGroup = groups[0];
+      
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: `📈 מנתח פעילות עבור "${selectedGroup.name}"...`
+      });
+
+      const hourlyActivity = await this.db.getActivityByHour(selectedGroup.id, 7);
+      const dailyActivity = await this.db.getActivityByDay(selectedGroup.id, 7);
+
+      if (!hourlyActivity || hourlyActivity.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאו נתוני פעילות עבור "${selectedGroup.name}"`
+        });
+        return;
+      }
+
+      const sortedHours = hourlyActivity.sort((a, b) => b.message_count - a.message_count);
+      const top3Hours = sortedHours.slice(0, 3);
+      
+      const peakHoursText = top3Hours.map((hour, index) => {
+        const emoji = ['🔥', '⚡', '✨'][index];
+        return `${emoji} ${hour.hour}:00 (${hour.message_count} הודעות)`;
+      }).join(', ');
+
+      const dailyTotals = dailyActivity.map(day => day.message_count);
+      const avgDaily = Math.round(dailyTotals.reduce((a, b) => a + b, 0) / dailyTotals.length);
+
+      const remoteActivityMessage = `📈 *ניתוח פעילות - ${selectedGroup.name}*
+
+🔥 *שעות השיא:* ${peakHoursText}
+📊 *ממוצע יומי:* ${avgDaily} הודעות
+📅 *ימים נבדקו:* ${dailyActivity.length}
+
+⏰ ${new Date().toLocaleString('he-IL')}`;
+
+      await this.socket.sendMessage(this.summaryTargetGroupId, { text: remoteActivityMessage });
+
+    } catch (error) {
+      logger.error('Failed to analyze remote activity:', error);
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: '❌ שגיאה בניתוח פעילות מרחוק'
+      });
+    }
+  }
+
+  /**
+   * Handle ASK question command (local)
+   */
+  async handleAskQuestion(message, question) {
+    const groupId = message.key.remoteJid;
+    
+    try {
+      if (!question || question.trim().length < 3) {
+        await this.socket.sendMessage(groupId, {
+          text: `❓ *איך להשתמש בפקודת !ask:*
+
+🎯 *שאל שאלות על תוכן הקבוצה:*
+• !ask מה הנושא המרכזי השבוע?
+• !ask מי דיבר על AI?
+• !ask איזה עצות ניתנו לגבי השקעות?
+• !ask מה היו הדעות על המוצר החדש?
+
+💡 *הבוט יחפש בהודעות האחרונות ויענה על בסיס התוכן*`
+        });
+        return;
+      }
+
+      await this.socket.sendMessage(groupId, {
+        text: '🤔 חושב על השאלה שלך... אנא המתן'
+      });
+
+      // Get recent messages for analysis
+      const messages = await this.db.getMessagesForAsk(groupId, 7, 50);
+      const overview = await this.db.getGroupOverview(groupId);
+
+      if (!messages || messages.length === 0) {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ לא נמצאו הודעות מתאימות לניתוח בקבוצה זו'
+        });
+        return;
+      }
+
+      const groupName = overview.groupName || 'קבוצה זו';
+      
+      // Prepare context for AI
+      const contextMessages = messages.slice(0, 30).map(msg => 
+        `[${new Date(msg.timestamp).toLocaleDateString('he-IL')}] ${msg.sender_name}: ${msg.content}`
+      ).join('\n');
+
+      // Generate answer using AI Agent
+      const analysisQuery = `בקשה: ${question}\n\nקונטקסט מקבוצת "${groupName}":\n${contextMessages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const analysisResult = await this.conversationHandler.processNaturalQuery(analysisQuery, null, 'system', false);
+
+      if (analysisResult.success) {
+        const formattedAnswer = `🤖 *תשובה לשאלתך: "${question}"*
+
+${analysisResult.analysis}
+
+📊 *מבוסס על:*
+• ${messages.length} הודעות אחרונות
+• ${groupName}
+• תקופה: 7 ימים אחרונים
+
+⏰ *נוצר ב-${new Date().toLocaleString('he-IL')}*`;
+
+        await this.socket.sendMessage(groupId, { text: formattedAnswer });
+
+      } else {
+        await this.socket.sendMessage(groupId, {
+          text: `❌ שגיאה בניתוח התוכן: ${analysisResult.error}`
+        });
+      }
+
+    } catch (error) {
+      logger.error('Failed to handle ask question:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בעיבוד השאלה. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle remote ASK question command (from management group)
+   */
+  async handleRemoteAsk(message, input) {
+    try {
+      // Parse input: "group_name | question"
+      const parts = input.split('|').map(p => p.trim());
+      
+      if (parts.length < 2) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❓ *שימוש בפקודת !ask מרחוק:*
+
+*שימוש נכון:*
+!ask [שם קבוצה] | [שאלה]
+
+💡 *דוגמאות:*
+• !ask AI TIPS | מה הנושא המרכזי השבוע?
+• !ask הילדים שלי ואני | מי דיבר על חינוך?
+• !ask חדשות טכנולוגיה | איזה חדשות היו?
+
+⚠️ *חשוב לכלול את הסימן | בין שם הקבוצה לשאלה*`
+        });
+        return;
+      }
+
+      const [groupName, question] = parts;
+
+      if (!groupName || !question) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: '❌ נא לכלול גם שם קבוצה וגם שאלה'
+        });
+        return;
+      }
+
+      const groups = await this.searchGroupsByName(groupName);
+      if (groups.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאה קבוצה המתאימה ל "${groupName}"\n\n💡 השתמש ב-!search כדי למצוא את השם המדויק`
+        });
+        return;
+      }
+
+      const selectedGroup = groups[0];
+      
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: `🤔 חושב על השאלה "${question}" עבור "${selectedGroup.name}"...`
+      });
+
+      // Get messages for analysis
+      const messages = await this.db.getMessagesForAsk(selectedGroup.id, 7, 50);
+
+      if (!messages || messages.length === 0) {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ לא נמצאו הודעות מתאימות לניתוח עבור "${selectedGroup.name}"`
+        });
+        return;
+      }
+
+      // Prepare context
+      const contextMessages = messages.slice(0, 30).map(msg => 
+        `[${new Date(msg.timestamp).toLocaleDateString('he-IL')}] ${msg.sender_name}: ${msg.content}`
+      ).join('\n');
+
+      // Generate analysis using AI Agent
+      const analysisQuery = `בקשה: ${question}\n\nקונטקסט מקבוצת "${selectedGroup.name}":\n${contextMessages}`;
+      const analysisResult = await this.conversationHandler.processNaturalQuery(analysisQuery, null, 'system', false);
+
+      if (analysisResult.success) {
+        const formattedAnswer = `🤖 *תשובה מרחוק - ${selectedGroup.name}*
+
+❓ *השאלה:* "${question}"
+
+${analysisResult.analysis}
+
+📊 *מבוסס על ${messages.length} הודעות מ-7 ימים אחרונים*
+
+⏰ ${new Date().toLocaleString('he-IL')}`;
+
+        await this.socket.sendMessage(this.summaryTargetGroupId, { text: formattedAnswer });
+
+      } else {
+        await this.socket.sendMessage(this.summaryTargetGroupId, {
+          text: `❌ שגיאה בניתוח תוכן עבור "${selectedGroup.name}": ${analysisResult.error}`
+        });
+      }
+
+    } catch (error) {
+      logger.error('Failed to handle remote ask:', error);
+      await this.socket.sendMessage(this.summaryTargetGroupId, {
+        text: '❌ שגיאה בעיבוד שאלה מרחוק'
       });
     }
   }
@@ -1508,38 +2436,846 @@ class WhatsAppBot {
     logger.info('👋 הבוט הושבת');
     process.exit(0);
   }
+
+  /**
+   * Handle !history command - get messages from specific date/period
+   * Now supports group name parameter when called from ניצן group
+   */
+  async handleHistoryCommand(message, args) {
+    // Debug log לוודא שהפונקציה נקראת
+    logger.info(`🔍 DEBUG handleHistoryCommand called with args: ${args.join(' ')}`);
+    
+    const groupId = message.key.remoteJid;
+    const isNitzanGroup = groupId === '972546262108-1556219067@g.us';
+    
+    try {
+      let targetGroupId = groupId;
+      let targetGroupName = null;
+      let startDate, endDate, period;
+      
+      // Check if first argument is a group name (only from ניצן group)
+      if (isNitzanGroup && args.length > 0 && !args[0].match(/^\d{4}-\d{2}-\d{2}$/) && !['yesterday', 'אתמול', 'week', 'שבוע', 'month', 'חודש'].includes(args[0].toLowerCase())) {
+        const groupName = args[0];
+        const groups = await this.db.allQuery('SELECT id, name FROM groups WHERE name LIKE ? AND is_active = 1', [`%${groupName}%`]);
+        
+        if (groups.length === 0) {
+          await this.socket.sendMessage(groupId, {
+            text: `❌ לא נמצאה קבוצה עם השם "${groupName}"`
+          });
+          return;
+        } else if (groups.length > 1) {
+          const groupsList = groups.map(g => `• ${g.name}`).join('\n');
+          await this.socket.sendMessage(groupId, {
+            text: `🔍 נמצאו מספר קבוצות:\n${groupsList}\n\nהשתמש בשם מדויק יותר`
+          });
+          return;
+        }
+        
+        targetGroupId = groups[0].id;
+        targetGroupName = groups[0].name;
+        args = args.slice(1); // Remove group name from args
+      }
+      
+      if (args.length === 0) {
+        // Default: last week
+        endDate = new Date();
+        startDate = new Date();
+        startDate.setDate(startDate.getDate() - 7);
+        period = 'השבוע האחרון';
+      } else if (args.length === 1) {
+        const arg = args[0].toLowerCase();
+        if (arg === 'yesterday' || arg === 'אתמול') {
+          startDate = new Date();
+          startDate.setDate(startDate.getDate() - 1);
+          startDate.setHours(0, 0, 0, 0);
+          endDate = new Date(startDate);
+          endDate.setHours(23, 59, 59, 999);
+          period = 'אתמול';
+        } else if (arg === 'week' || arg === 'שבוע') {
+          endDate = new Date();
+          startDate = new Date();
+          startDate.setDate(startDate.getDate() - 7);
+          period = 'השבוע האחרון';
+        } else if (arg === 'month' || arg === 'חודש') {
+          endDate = new Date();
+          startDate = new Date();
+          startDate.setMonth(startDate.getMonth() - 1);
+          period = 'החודש האחרון';
+        } else {
+          // Try to parse as date (YYYY-MM-DD)
+          const dateMatch = arg.match(/^\d{4}-\d{2}-\d{2}$/);
+          if (dateMatch) {
+            startDate = new Date(arg);
+            endDate = new Date(startDate);
+            endDate.setHours(23, 59, 59, 999);
+            period = arg;
+          } else {
+            await this.socket.sendMessage(groupId, {
+              text: '❌ פורמט תאריך לא תקין. השתמש ב: YYYY-MM-DD, או: yesterday, week, month'
+            });
+            return;
+          }
+        }
+      } else if (args.length === 2) {
+        // Date range: start-date end-date
+        try {
+          startDate = new Date(args[0]);
+          endDate = new Date(args[1]);
+          period = `${args[0]} עד ${args[1]}`;
+        } catch (err) {
+          await this.socket.sendMessage(groupId, {
+            text: '❌ פורמט תאריכים לא תקין. דוגמה: !history 2024-08-01 2024-08-07'
+          });
+          return;
+        }
+      }
+
+      const searchMessage = targetGroupName ? 
+        `🔍 מחפש הודעות מ${period} בקבוצת "${targetGroupName}"...` :
+        `🔍 מחפש הודעות מ${period}...`;
+      
+      await this.socket.sendMessage(groupId, { 
+        text: searchMessage
+      });
+
+      // Get messages from database
+      const messages = await this.db.getMessagesByDateRange(targetGroupId, startDate, endDate);
+      
+      // Debug log לבדיקת ההודעות
+      logger.info(`🔍 DEBUG messages found: ${messages.length} for date range ${startDate.toDateString()} - ${endDate.toDateString()}`);
+      logger.info(`🔍 DEBUG targetGroupId: ${targetGroupId}`);
+      
+      if (messages.length === 0) {
+        const noMessagesText = targetGroupName ? 
+          `📭 לא נמצאו הודעות מ${period} בקבוצת "${targetGroupName}"` :
+          `📭 לא נמצאו הודעות מ${period}`;
+        
+        await this.socket.sendMessage(groupId, {
+          text: noMessagesText
+        });
+        return;
+      }
+
+      // Create summary with AI
+      const currentGroupName = targetGroupName || (await this.db.getQuery('SELECT name FROM groups WHERE id = ?', [targetGroupId]))?.name || 'הקבוצה';
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${currentGroupName}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
+      
+      // Debug log לבדיקת התוצאה
+      logger.info(`🔍 DEBUG result.success: ${result.success}`);
+      logger.info(`🔍 DEBUG result keys: ${Object.keys(result).join(', ')}`);
+      
+      if (!result.success) {
+        await this.socket.sendMessage(groupId, {
+          text: `❌ שגיאה בייצור סיכום היסטוריה: ${result.error}`
+        });
+        return;
+      }
+      
+      // Format summary for WhatsApp
+      const formattedSummary = result.response;
+      
+      // Debug logs זמניים
+      logger.info(`🔍 DEBUG result.summary length: ${result.summary?.length || 'undefined'}`);
+      logger.info(`🔍 DEBUG formattedSummary length: ${formattedSummary?.length || 'undefined'}`); 
+      logger.info(`🔍 DEBUG currentGroupName: ${currentGroupName}`);
+      
+      const historyTitle = targetGroupName ? 
+        `📜 *סיכום היסטוריה - ${period}*\n*קבוצה: ${targetGroupName}*` :
+        `📜 *סיכום היסטוריה - ${period}*`;
+      
+      const responseText = `${historyTitle}\n\n${formattedSummary || result.summary || 'שגיאה בעיבוד הסיכום'}`;
+
+      await this.socket.sendMessage(groupId, { text: responseText });
+
+    } catch (error) {
+      logger.error('Error in handleHistoryCommand:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת היסטוריה. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle !date command - get messages from specific date/period with range support
+   * Based on !today functionality but with flexible date selection
+   */
+  async handleDateCommand(message, args) {
+    const groupId = message.key.remoteJid;
+    const isNitzanGroup = groupId === '972546262108-1556219067@g.us';
+    
+    try {
+      let targetGroupId = groupId;
+      let targetGroupName = null;
+      let startDate, endDate, period;
+      
+      // Check if we have a group name (only from ניצן group)
+      // Look for date patterns in the args to determine if first part is group name
+      let hasDateInArgs = false;
+      for (let i = 0; i < args.length; i++) {
+        if (args[i].match(/^\d{4}-\d{2}-\d{2}$/) || 
+            ['yesterday', 'אתמול', 'week', 'שבוע', 'month', 'חודש'].includes(args[i].toLowerCase())) {
+          hasDateInArgs = true;
+          break;
+        }
+      }
+      
+      if (isNitzanGroup && args.length > 1 && hasDateInArgs && !args[0].match(/^\d{4}-\d{2}-\d{2}$/) && !['yesterday', 'אתמול', 'week', 'שבוע', 'month', 'חודש'].includes(args[0].toLowerCase())) {
+        // Find where the group name ends and date begins
+        let groupNameParts = [];
+        let dateArgsStart = -1;
+        
+        for (let i = 0; i < args.length; i++) {
+          if (args[i].match(/^\d{4}-\d{2}-\d{2}$/) || 
+              ['yesterday', 'אתמול', 'week', 'שבוע', 'month', 'חודש'].includes(args[i].toLowerCase())) {
+            dateArgsStart = i;
+            break;
+          }
+          groupNameParts.push(args[i]);
+        }
+        
+        if (dateArgsStart > 0) {
+          const groupName = groupNameParts.join(' ');
+        
+        await this.socket.sendMessage(groupId, { 
+          text: `🔍 מחפש קבוצה: "${groupName}"...` 
+        });
+
+        const matches = await this.searchGroupsByName(groupName);
+        
+        if (matches.length === 0) {
+          await this.socket.sendMessage(groupId, {
+            text: `❌ לא נמצאה קבוצה עם השם "${groupName}"\nנסה פקודה !search "${groupName}" לחיפוש רחב יותר`
+          });
+          return;
+        }
+        
+        if (matches.length > 1) {
+          const topMatches = matches.slice(0, 5);
+          const matchList = topMatches.map((match, idx) => 
+            `${idx + 1}. ${match.name}`
+          ).join('\n');
+          
+          await this.socket.sendMessage(groupId, {
+            text: `🔍 נמצאו ${matches.length} קבוצות. האם התכוונת לאחת מאלה?\n\n${matchList}\n\nשלח !date עם השם המדויק`
+          });
+          return;
+        }
+        
+          // Single match found - proceed with date command
+          const targetGroup = matches[0];
+          targetGroupId = targetGroup.id;
+          targetGroupName = targetGroup.name;
+          args = args.slice(dateArgsStart); // Remove group name from args, keep date args
+          
+          await this.socket.sendMessage(groupId, { 
+            text: `📅 מכין סיכום תאריך לקבוצת "${targetGroup.name}"...`
+          });
+        }
+      }
+      
+      // Parse date arguments
+      if (args.length === 0) {
+        // Default: today
+        startDate = new Date();
+        startDate.setHours(0, 0, 0, 0);
+        endDate = new Date();
+        endDate.setHours(23, 59, 59, 999);
+        period = 'היום';
+      } else if (args.length === 1) {
+        const arg = args[0].toLowerCase();
+        if (arg === 'yesterday' || arg === 'אתמול') {
+          startDate = new Date();
+          startDate.setDate(startDate.getDate() - 1);
+          startDate.setHours(0, 0, 0, 0);
+          endDate = new Date(startDate);
+          endDate.setHours(23, 59, 59, 999);
+          period = 'אתמול';
+        } else if (arg === 'week' || arg === 'שבוע') {
+          endDate = new Date();
+          endDate.setHours(23, 59, 59, 999);
+          startDate = new Date();
+          startDate.setDate(startDate.getDate() - 7);
+          startDate.setHours(0, 0, 0, 0);
+          period = 'השבוע האחרון';
+        } else if (arg === 'month' || arg === 'חודש') {
+          endDate = new Date();
+          endDate.setHours(23, 59, 59, 999);
+          startDate = new Date();
+          startDate.setMonth(startDate.getMonth() - 1);
+          startDate.setHours(0, 0, 0, 0);
+          period = 'החודש האחרון';
+        } else {
+          // Try to parse as date (YYYY-MM-DD)
+          const dateMatch = arg.match(/^\d{4}-\d{2}-\d{2}$/);
+          if (dateMatch) {
+            startDate = new Date(arg);
+            startDate.setHours(0, 0, 0, 0);
+            endDate = new Date(startDate);
+            endDate.setHours(23, 59, 59, 999);
+            period = arg;
+          } else {
+            await this.socket.sendMessage(groupId, {
+              text: '❌ פורמט תאריך לא תקין. השתמש ב: YYYY-MM-DD, או: yesterday, week, month'
+            });
+            return;
+          }
+        }
+      } else if (args.length === 2) {
+        // Date range: start-date end-date
+        try {
+          const startStr = args[0];
+          const endStr = args[1];
+          
+          if (!startStr.match(/^\d{4}-\d{2}-\d{2}$/) || !endStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            throw new Error('Invalid date format');
+          }
+          
+          startDate = new Date(startStr);
+          startDate.setHours(0, 0, 0, 0);
+          endDate = new Date(endStr);
+          endDate.setHours(23, 59, 59, 999);
+          period = `${startStr} עד ${endStr}`;
+        } catch (err) {
+          await this.socket.sendMessage(groupId, {
+            text: '❌ פורמט תאריכים לא תקין. דוגמה: !date 2025-08-20 2025-08-22'
+          });
+          return;
+        }
+      } else {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ יותר מדי פרמטרים. דוגמאות:\n• !date 2025-08-29\n• !date 2025-08-20 2025-08-22\n• !date yesterday'
+        });
+        return;
+      }
+
+      const searchMessage = targetGroupName ? 
+        `🔍 מחפש הודעות מ${period} בקבוצת "${targetGroupName}"...` :
+        `🔍 מחפש הודעות מ${period}...`;
+
+      await this.socket.sendMessage(groupId, { 
+        text: searchMessage
+      });
+
+      // Get messages from database using date range
+      const messages = await this.db.getMessagesByDateRange(targetGroupId, startDate, endDate);
+      
+      if (messages.length === 0) {
+        const noMessagesText = targetGroupName ? 
+          `📭 לא נמצאו הודעות מ${period} בקבוצת "${targetGroupName}"` :
+          `📭 לא נמצאו הודעות מ${period}`;
+        
+        await this.socket.sendMessage(groupId, {
+          text: noMessagesText
+        });
+        return;
+      }
+
+      logger.info(`📊 מייצר סיכום תאריך עבור ${period} (${messages.length} הודעות)`);
+      
+      // Generate summary using the existing SummaryService
+      const currentGroupName = targetGroupName || (await this.db.getQuery('SELECT name FROM groups WHERE id = ?', [targetGroupId]))?.name || 'הקבוצה';
+      const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${currentGroupName}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
+      const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
+      
+      if (!result.success) {
+        await this.socket.sendMessage(groupId, {
+          text: `❌ שגיאה בייצור סיכום: ${result.error}`
+        });
+        return;
+      }
+      
+      // Format summary for WhatsApp (same as other commands)
+      const formattedSummary = result.response;
+      
+      const dateTitle = targetGroupName ? 
+        `📅 *סיכום תאריך - ${period}*\n*קבוצה: ${targetGroupName}*` :
+        `📅 *סיכום תאריך - ${period}*`;
+      
+      const responseText = `${dateTitle}\n\n${formattedSummary}`;
+
+      await this.socket.sendMessage(groupId, { text: responseText });
+      
+      // Save summary to database  
+      const summaryData = {
+        groupId: targetGroupId,
+        summaryText: result.summary,
+        messagesCount: messages.length,
+        startTime: messages[0]?.timestamp || startDate.toISOString(),
+        endTime: messages[messages.length - 1]?.timestamp || endDate.toISOString(),
+        modelUsed: result.metadata.model,
+        tokensUsed: result.metadata.tokensUsed
+      };
+      
+      const summaryId = await this.db.saveSummary(summaryData);
+      logger.info(`💾 סיכום תאריך נשמר (ID: ${summaryId}) עבור תקופת ${period}`);
+
+    } catch (error) {
+      logger.error('Error in handleDateCommand:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת סיכום תאריך. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle !search-history command - search for specific content
+   */
+  async handleSearchHistory(message, searchTerm) {
+    const groupId = message.key.remoteJid;
+    const isNitzanGroup = groupId === '972546262108-1556219067@g.us';
+    
+    try {
+      let targetGroupId = groupId;
+      let targetGroupName = null;
+      
+      // Check if searchTerm contains group name (only from ניצן group)
+      if (isNitzanGroup && searchTerm.includes(' ')) {
+        const parts = searchTerm.split(' ');
+        const possibleGroupName = parts[0];
+        
+        // Check if first word is a group name
+        const groups = await this.db.allQuery('SELECT id, name FROM groups WHERE name LIKE ? AND is_active = 1', [`%${possibleGroupName}%`]);
+        
+        if (groups.length === 1) {
+          targetGroupId = groups[0].id;
+          targetGroupName = groups[0].name;
+          searchTerm = parts.slice(1).join(' '); // Remove group name from search term
+        }
+      }
+      
+      const searchMessage = targetGroupName ? 
+        `🔍 מחפש "${searchTerm}" בהיסטוריה של "${targetGroupName}"...` :
+        `🔍 מחפש "${searchTerm}" בהיסטוריה...`;
+      
+      await this.socket.sendMessage(groupId, { 
+        text: searchMessage
+      });
+
+      // Search in database
+      const results = await this.db.searchMessagesContent(targetGroupId, searchTerm);
+      
+      if (results.length === 0) {
+        const noResultsText = targetGroupName ? 
+          `📭 לא נמצאו תוצאות לחיפוש "${searchTerm}" בקבוצת "${targetGroupName}"` :
+          `📭 לא נמצאו תוצאות לחיפוש "${searchTerm}"`;
+        
+        await this.socket.sendMessage(groupId, {
+          text: noResultsText
+        });
+        return;
+      }
+
+      // Group results by date
+      const groupedResults = {};
+      results.forEach(msg => {
+        const date = new Date(msg.timestamp).toLocaleDateString('he-IL');
+        if (!groupedResults[date]) groupedResults[date] = [];
+        groupedResults[date].push(msg);
+      });
+
+      const searchTitle = targetGroupName ? 
+        `🔍 *תוצאות חיפוש: "${searchTerm}"*\n*קבוצה: ${targetGroupName}*` :
+        `🔍 *תוצאות חיפוש: "${searchTerm}"*`;
+      
+      let responseText = `${searchTitle}\n\n`;
+      
+      const dates = Object.keys(groupedResults).slice(0, 5); // Show max 5 dates
+      dates.forEach(date => {
+        responseText += `📅 *${date}:*\n`;
+        groupedResults[date].slice(0, 3).forEach(msg => { // Max 3 messages per date
+          const sender = msg.sender_name || 'משתמש לא ידוע';
+          const content = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
+          const time = new Date(msg.timestamp).toLocaleTimeString('he-IL', {hour: '2-digit', minute:'2-digit'});
+          responseText += `• ${time} ${sender}: ${content}\n`;
+        });
+        responseText += '\n';
+      });
+
+      if (results.length > 15) {
+        responseText += `\n📈 נמצאו ${results.length} תוצאות נוספות...`;
+      }
+
+      await this.socket.sendMessage(groupId, { text: responseText });
+
+    } catch (error) {
+      logger.error('Error in handleSearchHistory:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בחיפוש בהיסטוריה. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle !timeline command - show activity timeline
+   * Now supports group name parameter when called from ניצן group
+   */
+  async handleTimelineCommand(message, args) {
+    const groupId = message.key.remoteJid;
+    const isNitzanGroup = groupId === '972546262108-1556219067@g.us';
+    
+    try {
+      let targetGroupId = groupId;
+      let targetGroupName = null;
+      
+      // Check if first argument is a group name (only from ניצן group)
+      if (isNitzanGroup && args.length > 0 && !['day', 'יום', 'week', 'שבוע', 'month', 'חודש'].includes(args[0].toLowerCase())) {
+        const groupName = args[0];
+        const groups = await this.db.allQuery('SELECT id, name FROM groups WHERE name LIKE ? AND is_active = 1', [`%${groupName}%`]);
+        
+        if (groups.length === 1) {
+          targetGroupId = groups[0].id;
+          targetGroupName = groups[0].name;
+          args = args.slice(1); // Remove group name from args
+        }
+      }
+      
+      const period = args[0] || 'week';
+      let days;
+      
+      switch (period.toLowerCase()) {
+        case 'day':
+        case 'יום':
+          days = 1;
+          break;
+        case 'week':
+        case 'שבוע':
+          days = 7;
+          break;
+        case 'month':
+        case 'חודש':
+          days = 30;
+          break;
+        default:
+          days = 7;
+      }
+
+      const timelineMessage = targetGroupName ? 
+        `📈 מכין ציר זמן לפעילות של ${days} ימים אחרונים בקבוצת "${targetGroupName}"...` :
+        `📈 מכין ציר זמן לפעילות של ${days} ימים אחרונים...`;
+      
+      await this.socket.sendMessage(groupId, { 
+        text: timelineMessage
+      });
+
+      // Get activity data
+      const timeline = await this.db.getActivityTimeline(targetGroupId, days);
+      
+      if (timeline.length === 0) {
+        const noDataText = targetGroupName ? 
+          `📭 אין נתוני פעילות לתקופה זו בקבוצת "${targetGroupName}"` :
+          '📭 אין נתוני פעילות לתקופה זו';
+        
+        await this.socket.sendMessage(groupId, {
+          text: noDataText
+        });
+        return;
+      }
+
+      const timelineTitle = targetGroupName ? 
+        `📈 *ציר זמן פעילות - ${days} ימים אחרונים*\n*קבוצה: ${targetGroupName}*` :
+        `📈 *ציר זמן פעילות - ${days} ימים אחרונים*`;
+      
+      let responseText = `${timelineTitle}\n\n`;
+      
+      timeline.forEach(day => {
+        const date = new Date(day.date).toLocaleDateString('he-IL');
+        const dayName = new Date(day.date).toLocaleDateString('he-IL', { weekday: 'long' });
+        const bar = '█'.repeat(Math.min(Math.floor(day.count / 10), 20)) || '▌';
+        responseText += `📅 ${date} (${dayName})\n💬 ${day.count} הודעות ${bar}\n👥 ${day.active_users} משתמשים פעילים\n\n`;
+      });
+
+      // Add peak hours
+      const peakHour = await this.db.getPeakHour(targetGroupId, days);
+      if (peakHour) {
+        responseText += `🌟 *שעת השיא:* ${peakHour.hour}:00-${peakHour.hour + 1}:00 (${peakHour.count} הודעות)`;
+      }
+
+      await this.socket.sendMessage(groupId, { text: responseText });
+
+    } catch (error) {
+      logger.error('Error in handleTimelineCommand:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה ביצירת ציר זמן. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * Handle !group-stats command - comprehensive group statistics
+   * Now supports group name parameter when called from ניצן group
+   */
+  async handleGroupStats(message, args) {
+    const groupId = message.key.remoteJid;
+    const isNitzanGroup = groupId === '972546262108-1556219067@g.us';
+    
+    try {
+      let targetGroupId = groupId;
+      let targetGroupName = null;
+      
+      // Check if first argument is a group name (only from ניצן group)
+      if (isNitzanGroup && args && args.length > 0) {
+        const groupName = args[0];
+        const groups = await this.db.allQuery('SELECT id, name FROM groups WHERE name LIKE ? AND is_active = 1', [`%${groupName}%`]);
+        
+        if (groups.length === 1) {
+          targetGroupId = groups[0].id;
+          targetGroupName = groups[0].name;
+        } else if (groups.length > 1) {
+          const groupsList = groups.map(g => `• ${g.name}`).join('\n');
+          await this.socket.sendMessage(groupId, {
+            text: `🔍 נמצאו מספר קבוצות:\n${groupsList}\n\nהשתמש בשם מדויק יותר`
+          });
+          return;
+        } else if (groups.length === 0) {
+          await this.socket.sendMessage(groupId, {
+            text: `❌ לא נמצאה קבוצה עם השם "${groupName}"`
+          });
+          return;
+        }
+      }
+      
+      const statsMessage = targetGroupName ? 
+        `📊 מכין סטטיסטיקות מפורטות של "${targetGroupName}"...` :
+        '📊 מכין סטטיסטיקות מפורטות...';
+      
+      await this.socket.sendMessage(groupId, { 
+        text: statsMessage
+      });
+
+      // Get comprehensive stats
+      const stats = await this.db.getComprehensiveGroupStats(targetGroupId);
+      
+      if (!stats) {
+        const noDataText = targetGroupName ? 
+          `📭 אין מספיק נתונים לסטטיסטיקות בקבוצת "${targetGroupName}"` :
+          '📭 אין מספיק נתונים לסטטיסטיקות';
+        
+        await this.socket.sendMessage(groupId, {
+          text: noDataText
+        });
+        return;
+      }
+
+      const statsTitle = targetGroupName ? 
+        `📊 *סטטיסטיקות הקבוצה*\n*קבוצה: ${targetGroupName}*` :
+        '📊 *סטטיסטיקות הקבוצה*';
+      
+      let responseText = `${statsTitle}\n\n`;
+      
+      responseText += `💬 *סה"כ הודעות:* ${stats.total_messages.toLocaleString()}\n`;
+      responseText += `👥 *משתמשים פעילים:* ${stats.active_users}\n`;
+      responseText += `📈 *ממוצע הודעות ביום:* ${Math.round(stats.daily_average)}\n`;
+      responseText += `🎯 *פעילות השבוע:* ${stats.week_messages.toLocaleString()} הודעות\n\n`;
+      
+      responseText += `🏆 *המשתמשים המובילים:*\n`;
+      if (stats.top_users && stats.top_users.length > 0) {
+        stats.top_users.slice(0, 5).forEach((user, index) => {
+          const medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][index] || '•';
+          responseText += `${medal} ${user.name}: ${user.count} הודעות\n`;
+        });
+      }
+      
+      responseText += `\n⏰ *הזמנים הפעילים ביותר:*\n`;
+      if (stats.peak_hours && stats.peak_hours.length > 0) {
+        stats.peak_hours.slice(0, 3).forEach(hour => {
+          responseText += `• ${hour.hour}:00-${hour.hour + 1}:00 (${hour.count} הודעות)\n`;
+        });
+      }
+
+      if (stats.oldest_message) {
+        const oldestDate = new Date(stats.oldest_message).toLocaleDateString('he-IL');
+        responseText += `\n📅 *הודעה ראשונה:* ${oldestDate}`;
+      }
+
+      await this.socket.sendMessage(groupId, { text: responseText });
+
+    } catch (error) {
+      logger.error('Error in handleGroupStats:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת סטטיסטיקות. נסה שוב מאוחר יותר.'
+      });
+    }
+  }
+
+  /**
+   * בדיקה אם הקבוצה מוגדרת לשיחה טבעית
+   */
+  isConversationGroup(groupId) {
+    // קבוצת "Nitzan bot" מוגדרת לשיחה טבעית
+    const conversationGroupId = '120363417758222119@g.us'; // Nitzan bot
+    return groupId === conversationGroupId;
+    
+    // בעתיד אפשר להרחיב לקבוצות נוספות:
+    // const conversationGroups = process.env.CONVERSATION_GROUPS?.split(',') || [conversationGroupId];
+    // return conversationGroups.includes(groupId);
+  }
+
+  /**
+   * עיבוד שיחה טבעית
+   */
+  async handleNaturalConversation(message, text, groupId, senderId, senderName) {
+    try {
+      const startTime = Date.now();
+      
+      // בניית הקשר לשאלה
+      const context = {
+        groupId,
+        senderId,
+        senderName,
+        requestTime: new Date().toISOString(),
+        messageKey: message.key
+      };
+      
+      // עיבוד השאלה עם ConversationHandler
+      const response = await this.conversationHandler.processNaturalQuery(text, groupId);
+      
+      // שליחת התשובה לקבוצה
+      await this.socket.sendMessage(groupId, { 
+        text: response,
+        quoted: message // מענה לההודעה המקורית
+      });
+      
+      const duration = Date.now() - startTime;
+      
+      // שמירת הקשר השיחה במסד הנתונים
+      await this.saveConversationContext(context, text, response, duration);
+      
+      logger.info(`✅ שיחה טבעית עובדה תוך ${duration}ms עבור ${senderName}`);
+      
+    } catch (error) {
+      logger.error('Error handling natural conversation:', error);
+      
+      // שליחת הודעת שגיאה נדיבה למשתמש
+      try {
+        await this.socket.sendMessage(groupId, {
+          text: `❌ מצטער ${senderName}, יש לי קצת בעיה טכנית עכשיו.\nאנסה שוב מאוחר יותר או נסח את השאלה אחרת.`,
+          quoted: message
+        });
+      } catch (sendError) {
+        logger.error('Failed to send error message:', sendError);
+      }
+    }
+  }
+
+  /**
+   * שמירת הקשר השיחה במסד הנתונים
+   */
+  async saveConversationContext(context, question, response, responseTimeMs) {
+    try {
+      await this.db.runQuery(`
+        INSERT INTO conversation_context (
+          group_id, user_id, last_question, last_response, 
+          context_data, response_time_ms, ai_model_used
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [
+        context.groupId,
+        context.senderId, 
+        question,
+        response,
+        JSON.stringify({
+          senderName: context.senderName,
+          requestTime: context.requestTime,
+          messageKey: context.messageKey
+        }),
+        responseTimeMs,
+        this.conversationHandler.model
+      ]);
+      
+    } catch (error) {
+      logger.error('Failed to save conversation context:', error);
+    }
+  }
+
+  /**
+   * Handle !mygroups command - Show all groups with their IDs for configuration
+   */
+  async handleMyGroups(message) {
+    const groupId = message.key.remoteJid;
+    
+    try {
+      logger.info('📋 [MY GROUPS] Fetching all connected groups');
+      
+      // Get all active groups from database
+      const groups = await this.db.allQuery(`
+        SELECT 
+          g.id,
+          g.name,
+          COUNT(m.id) as message_count,
+          MAX(m.timestamp) as last_message_time
+        FROM groups g
+        LEFT JOIN messages m ON g.id = m.group_id
+        WHERE g.is_active = 1
+        GROUP BY g.id, g.name
+        ORDER BY message_count DESC
+      `);
+      
+      if (!groups || groups.length === 0) {
+        await this.socket.sendMessage(groupId, {
+          text: '❌ לא נמצאו קבוצות פעילות'
+        });
+        return;
+      }
+      
+      // Build response message
+      let response = `🏠 *רשימת הקבוצות שלך (${groups.length} קבוצות):*\n\n`;
+      response += `⚠️ *חשוב - הגדרות ראשוניות:*\n`;
+      response += `1. בחר *קבוצת ניהול אחת* (כמו "Nitzan bot")\n`;
+      response += `2. העתק את ה-ID שלה\n`;
+      response += `3. החלף את ה-ID בקבצים:\n`;
+      response += `   • src/services/DatabaseAgentTools.js (שורה 756)\n`;
+      response += `   • src/bot.js - חפש "summaryTargetGroupId"\n\n`;
+      response += `💡 *הקבוצה הזו תוכל:*\n`;
+      response += `• לשלוח פקודות לקבוצות אחרות\n`;
+      response += `• לקבל סיכומים אוטומטיים\n`;
+      response += `• לנהל את הבוט\n\n`;
+      response += `📊 *הקבוצות שלך:*\n`;
+      response += `────────────────────────\n\n`;
+      
+      // Add groups to response
+      groups.forEach((group, index) => {
+        const lastMessageDate = group.last_message_time ? 
+          new Date(group.last_message_time).toLocaleDateString('he-IL') : 
+          'אין הודעות';
+        
+        response += `${index + 1}. *${group.name}*\n`;
+        response += `   📱 ID: \`${group.id}\`\n`;
+        response += `   💬 הודעות: ${group.message_count || 0}\n`;
+        response += `   ⏰ הודעה אחרונה: ${lastMessageDate}\n`;
+        response += `   ────────────────\n`;
+      });
+      
+      response += `\n💡 *טיפ:* לחץ על ה-ID כדי להעתיק אותו`;
+      
+      // Also log to console for easy copying
+      console.log('\n🏠 ========== YOUR GROUPS ==========');
+      groups.forEach((group, index) => {
+        console.log(`${index + 1}. ${group.name}`);
+        console.log(`   ID: ${group.id}`);
+        console.log(`   Messages: ${group.message_count || 0}`);
+        console.log('   ─────────────────────────');
+      });
+      console.log('===================================\n');
+      
+      await this.socket.sendMessage(groupId, { text: response });
+      
+    } catch (error) {
+      logger.error('Error in handleMyGroups:', error);
+      await this.socket.sendMessage(groupId, {
+        text: '❌ שגיאה בקבלת רשימת הקבוצות'
+      });
+    }
+  }
 }
 
-// Handle process termination gracefully
-const bot = new WhatsAppBot();
+module.exports = WhatsAppBot;
 
-process.on('SIGINT', () => {
-  logger.info('📱 נתקבל אות SIGINT');
-  bot.shutdown();
-});
-
-process.on('SIGTERM', () => {
-  logger.info('📱 נתקבל אות SIGTERM');
-  bot.shutdown();
-});
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error);
-  bot.shutdown();
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  bot.shutdown();
-});
-
-// Start the bot
+// Start the bot if this file is run directly
 if (require.main === module) {
-  bot.initialize().catch((error) => {
+  console.log('📱 Initializing WhatsApp Bot...');
+  const bot = new WhatsAppBot();
+  bot.initialize().catch(error => {
     logger.error('Failed to start bot:', error);
     process.exit(1);
   });
 }
-
-module.exports = WhatsAppBot;

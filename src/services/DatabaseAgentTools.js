@@ -412,6 +412,56 @@ class DatabaseAgentTools {
           },
           required: ['group_name', 'message']
         }
+      },
+      {
+        name: 'find_contact',
+        description: 'Find a WhatsApp contact by name or phone number. Use this to search for contacts in the database.',
+        parameters: {
+          type: 'object',
+          properties: {
+            contact_name: {
+              type: 'string',
+              description: 'Name or phone number of the contact to find'
+            }
+          },
+          required: ['contact_name']
+        }
+      },
+      {
+        name: 'send_message_to_contact',
+        description: 'Send a WhatsApp message to a specific contact (individual/private chat). Use this when the user asks to send a message to a person, not a group. Examples: "שלח הודעה לאמא", "תגיד ליוסי", "תשלח למספר 0545551234". Only works from authorized groups.',
+        parameters: {
+          type: 'object',
+          properties: {
+            contact_name: {
+              type: 'string',
+              description: 'Name or phone number of the contact to send message to'
+            },
+            message: {
+              type: 'string',
+              description: 'The message text to send'
+            }
+          },
+          required: ['contact_name', 'message']
+        }
+      },
+      {
+        name: 'search_contacts',
+        description: 'Search for contacts by name or phone number. Returns a list of matching contacts.',
+        parameters: {
+          type: 'object',
+          properties: {
+            search_term: {
+              type: 'string',
+              description: 'Search term (name or phone number)'
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of results (default: 10)'
+            }
+          },
+          required: ['search_term']
+        }
       }
     ];
   }
@@ -457,6 +507,15 @@ class DatabaseAgentTools {
           
         case 'send_message_to_group':
           return await this.sendMessageToGroup(parameters.group_name, parameters.message);
+          
+        case 'find_contact':
+          return await this.findContactByName(parameters.contact_name);
+          
+        case 'send_message_to_contact':
+          return await this.sendMessageToContact(parameters.contact_name, parameters.message);
+          
+        case 'search_contacts':
+          return await this.searchContacts(parameters.search_term, parameters.limit);
           
         default:
           throw new Error(`Unknown tool: ${toolName}`);
@@ -520,6 +579,171 @@ class DatabaseAgentTools {
         success: false,
         error: `שגיאה בשליחת הודעה לקבוצת "${groupName}": ${error.message}`
       };
+    }
+  }
+
+  /**
+   * Find contact by name or phone number - NEW TOOL (Same logic as groups + text normalization)
+   */
+  async findContactByName(contactName) {
+    try {
+      logger.info(`👤 [DB TOOLS] Searching for contact: "${contactName}"`);
+      
+      // Helper function for text normalization (Hebrew issues)
+      const normalizeText = (text) => {
+        return text
+          .toLowerCase()
+          .replace(/\s+/g, ' ')        // Multiple spaces to single space
+          .trim()
+          .replace(/אא+/g, 'א')        // Fix אאבא -> אבא
+          .replace(/[aא]/g, 'א')       // Fix 'a' vs 'א' confusion
+          .replace(/[rר]/g, 'ר')       // Fix 'r' vs 'ר' confusion  
+          .replace(/[oאו]/g, 'או');     // Fix 'o' vs 'או' confusion
+      };
+      
+      // First try exact match (same as groups logic)
+      let contact = await this.db.getQuery(
+        `SELECT phone_number, name
+         FROM contacts 
+         WHERE LOWER(name) = LOWER(?)
+         ORDER BY name ASC
+         LIMIT 1`,
+        [contactName]
+      );
+      
+      // If no exact match, try with normalization
+      if (!contact) {
+        logger.info(`🔄 [DB TOOLS] Trying with text normalization...`);
+        const normalizedSearch = normalizeText(contactName);
+        
+        const allContacts = await this.db.allQuery(`SELECT phone_number, name FROM contacts`, []);
+        contact = allContacts.find(c => normalizeText(c.name) === normalizedSearch);
+        
+        if (contact) {
+          logger.info(`✅ [DB TOOLS] Found with normalization: ${contact.name}`);
+        }
+      }
+      
+      // If still no match, try partial match (same as groups logic)
+      if (!contact) {
+        logger.info(`🔍 [DB TOOLS] No exact match found, trying partial search...`);
+        contact = await this.db.getQuery(
+          `SELECT phone_number, name
+           FROM contacts 
+           WHERE LOWER(name) LIKE LOWER(?)
+           ORDER BY LENGTH(name) ASC, name ASC
+           LIMIT 1`,
+          [`%${contactName}%`]
+        );
+        
+        // If still no match, try partial with normalization
+        if (!contact) {
+          const normalizedSearch = normalizeText(contactName);
+          const allContacts = await this.db.allQuery(`SELECT phone_number, name FROM contacts`, []);
+          contact = allContacts.find(c => normalizeText(c.name).includes(normalizedSearch));
+          
+          if (contact) {
+            logger.info(`✅ [DB TOOLS] Found partial match with normalization: ${contact.name}`);
+          }
+        }
+      }
+      
+      if (contact) {
+        logger.info(`✅ [DB TOOLS] Final result - Found contact: ${contact.name} (${contact.phone_number})`);
+        // Format phone number for WhatsApp
+        const formattedNumber = contact.phone_number.includes('@') 
+          ? contact.phone_number 
+          : contact.phone_number + '@s.whatsapp.net';
+        return { 
+          id: formattedNumber, 
+          name: contact.name || contactName,
+          phone: contact.phone_number
+        };
+      }
+      
+      logger.info(`❌ [DB TOOLS] Contact not found: "${contactName}"`);
+      return null;
+      
+    } catch (error) {
+      logger.error('Error finding contact:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Send message to a specific WhatsApp contact - NEW TOOL
+   */
+  async sendMessageToContact(contactName, message) {
+    try {
+      logger.info(`📤 [DB TOOLS] Attempting to send message to contact: "${contactName}"`);
+      
+      // Permission check - only works from authorized groups
+      if (!this.isAuthorizedForSending()) {
+        logger.warn(`🚫 [DB TOOLS] Unauthorized attempt to send message from non-authorized group`);
+        return {
+          success: false,
+          error: 'שליחת הודעות לאנשי קשר מותרת רק מקבוצות מורשות'
+        };
+      }
+
+      // Find contact by name
+      const contact = await this.findContactByName(contactName);
+      if (!contact) {
+        logger.warn(`🚫 [DB TOOLS] Contact not found: "${contactName}"`);
+        return {
+          success: false,
+          error: `איש הקשר "${contactName}" לא נמצא`
+        };
+      }
+
+      const contactId = contact.id;
+
+      // Send message via bot instance
+      if (!this.botInstance || !this.botInstance.socket) {
+        logger.error(`🚫 [DB TOOLS] Bot instance not available for message sending`);
+        return {
+          success: false,
+          error: 'מערכת הבוט לא זמינה כרגע לשליחת הודעות'
+        };
+      }
+
+      await this.botInstance.socket.sendMessage(contactId, { text: message });
+      
+      logger.info(`✅ [DB TOOLS] Message sent successfully to "${contact.name}" (${contactId})`);
+      return {
+        success: true,
+        message: `הודעה נשלחה בהצלחה ל-${contact.name}`
+      };
+
+    } catch (error) {
+      logger.error(`❌ [DB TOOLS] Error sending message to contact "${contactName}":`, error);
+      return {
+        success: false,
+        error: `שגיאה בשליחת הודעה ל-"${contactName}": ${error.message}`
+      };
+    }
+  }
+
+  /**
+   * Search contacts by name or phone - NEW TOOL
+   */
+  async searchContacts(searchTerm, limit = 10) {
+    try {
+      const contacts = await this.db.allQuery(
+        `SELECT phone_number, name 
+         FROM contacts 
+         WHERE LOWER(name) LIKE LOWER(?) OR phone_number LIKE ?
+         ORDER BY name
+         LIMIT ?`,
+        [`%${searchTerm}%`, `%${searchTerm}%`, limit]
+      );
+      
+      logger.info(`🔍 [DB TOOLS] Found ${contacts.length} contacts matching "${searchTerm}"`);
+      return contacts;
+      
+    } catch (error) {
+      logger.error('Error searching contacts:', error);
+      return [];
     }
   }
 
