@@ -453,6 +453,156 @@ class DatabaseManager {
     return await this.allQuery(sql, [days]);
   }
 
+  // ===== ANALYTICS METHODS =====
+
+  /**
+   * Get message statistics for a group in a time period
+   */
+  async getGroupStats(groupId, days = 7) {
+    const sql = `
+      SELECT 
+        sender_name,
+        COUNT(*) as message_count,
+        MIN(timestamp) as first_message,
+        MAX(timestamp) as last_message,
+        AVG(LENGTH(content)) as avg_message_length
+      FROM messages 
+      WHERE group_id = ? 
+      AND timestamp > datetime('now', '-${days} days')
+      GROUP BY sender_name, sender_id
+      ORDER BY message_count DESC
+    `;
+    
+    try {
+      const results = await this.allQuery(sql, [groupId]);
+      return results;
+    } catch (error) {
+      logger.error('Failed to get group stats:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get activity by hour of day for a group
+   */
+  async getActivityByHour(groupId, days = 7) {
+    const sql = `
+      SELECT 
+        CAST(strftime('%H', timestamp, 'localtime') AS INTEGER) as hour,
+        COUNT(*) as message_count
+      FROM messages 
+      WHERE group_id = ? 
+      AND timestamp > datetime('now', '-${days} days')
+      GROUP BY hour
+      ORDER BY hour
+    `;
+    
+    try {
+      const results = await this.allQuery(sql, [groupId]);
+      // Fill missing hours with 0
+      const hourlyData = Array(24).fill(0);
+      results.forEach(row => {
+        hourlyData[row.hour] = row.message_count;
+      });
+      return hourlyData.map((count, hour) => ({ hour, count }));
+    } catch (error) {
+      logger.error('Failed to get activity by hour:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get activity by day of week for a group
+   */
+  async getActivityByDay(groupId, days = 30) {
+    const sql = `
+      SELECT 
+        CASE strftime('%w', timestamp, 'localtime')
+          WHEN '0' THEN 'ראשון'
+          WHEN '1' THEN 'שני'
+          WHEN '2' THEN 'שלישי'
+          WHEN '3' THEN 'רביעי'
+          WHEN '4' THEN 'חמישי'
+          WHEN '5' THEN 'שישי'
+          WHEN '6' THEN 'שבת'
+        END as day_name,
+        strftime('%w', timestamp, 'localtime') as day_num,
+        COUNT(*) as message_count
+      FROM messages 
+      WHERE group_id = ? 
+      AND timestamp > datetime('now', '-${days} days')
+      GROUP BY day_num
+      ORDER BY day_num
+    `;
+    
+    try {
+      const results = await this.allQuery(sql, [groupId]);
+      return results;
+    } catch (error) {
+      logger.error('Failed to get activity by day:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get messages for content analysis
+   */
+  async getMessagesForAnalysis(groupId, days = 7, limit = 200) {
+    const sql = `
+      SELECT sender_name, content, timestamp
+      FROM messages 
+      WHERE group_id = ? 
+      AND timestamp > datetime('now', '-${days} days')
+      AND LENGTH(content) > 10
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `;
+    
+    try {
+      const results = await this.allQuery(sql, [groupId, limit]);
+      return results;
+    } catch (error) {
+      logger.error('Failed to get messages for analysis:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get group overview statistics
+   */
+  async getGroupOverview(groupId) {
+    const overviewSql = `
+      SELECT 
+        COUNT(*) as total_messages,
+        COUNT(DISTINCT sender_id) as unique_senders,
+        MIN(timestamp) as first_message_date,
+        MAX(timestamp) as last_message_date,
+        AVG(LENGTH(content)) as avg_message_length
+      FROM messages 
+      WHERE group_id = ?
+    `;
+    
+    const recentSql = `
+      SELECT COUNT(*) as recent_messages
+      FROM messages 
+      WHERE group_id = ? 
+      AND timestamp > datetime('now', '-7 days')
+    `;
+    
+    try {
+      const [overview] = await this.allQuery(overviewSql, [groupId]);
+      const [recent] = await this.allQuery(recentSql, [groupId]);
+      
+      return {
+        ...overview,
+        recent_messages: recent.recent_messages
+      };
+    } catch (error) {
+      logger.error('Failed to get group overview:', error);
+      return null;
+    }
+  }
+
   // ===== UTILITY METHODS =====
 
   /**
@@ -498,6 +648,471 @@ class DatabaseManager {
       logger.error('Failed to get database info:', error);
       return null;
     }
+  }
+
+  /**
+   * Get messages for content analysis (for ASK functionality)
+   * Returns recent messages with context for AI analysis
+   */
+  async getMessagesForAsk(groupId, days = 7, limit = 100) {
+    try {
+      const sql = `
+        SELECT 
+          m.content,
+          m.sender_name,
+          m.timestamp,
+          m.message_type
+        FROM messages m
+        WHERE m.group_id = ?
+        AND m.timestamp > datetime('now', '-${days} days')
+        AND m.content IS NOT NULL
+        AND m.content != ''
+        AND m.content NOT LIKE '!%'  -- Exclude bot commands
+        AND LENGTH(m.content) > 3    -- Exclude very short messages
+        ORDER BY m.timestamp DESC
+        LIMIT ?
+      `;
+      
+      return new Promise((resolve, reject) => {
+        this.db.all(sql, [groupId, limit], (err, rows) => {
+          if (err) {
+            logger.error('Error getting messages for ask:', err.message);
+            reject(err);
+          } else {
+            resolve(rows || []);
+          }
+        });
+      });
+    } catch (error) {
+      logger.error('Error in getMessagesForAsk:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Search messages by content for specific topics
+   */
+  async searchMessagesByContent(groupId, searchTerm, days = 30, limit = 50) {
+    try {
+      const sql = `
+        SELECT 
+          m.content,
+          m.sender_name,
+          m.timestamp,
+          m.message_type
+        FROM messages m
+        WHERE m.group_id = ?
+        AND m.timestamp > datetime('now', '-${days} days')
+        AND (
+          LOWER(m.content) LIKE LOWER(?)
+          OR LOWER(m.content) LIKE LOWER(?)
+          OR LOWER(m.content) LIKE LOWER(?)
+        )
+        AND m.content IS NOT NULL
+        AND m.content != ''
+        AND m.content NOT LIKE '!%'
+        ORDER BY m.timestamp DESC
+        LIMIT ?
+      `;
+      
+      const searchPattern1 = `%${searchTerm}%`;
+      const searchPattern2 = `%${searchTerm.split(' ').join('%')}%`;
+      const searchPattern3 = `%${searchTerm.replace(/\s+/g, '%')}%`;
+      
+      return new Promise((resolve, reject) => {
+        this.db.all(sql, [groupId, searchPattern1, searchPattern2, searchPattern3, limit], (err, rows) => {
+          if (err) {
+            logger.error('Error searching messages by content:', err.message);
+            reject(err);
+          } else {
+            resolve(rows || []);
+          }
+        });
+      });
+    } catch (error) {
+      logger.error('Error in searchMessagesByContent:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get conversation context around specific timeframe
+   */
+  async getConversationContext(groupId, targetDate, contextHours = 2) {
+    try {
+      const sql = `
+        SELECT 
+          m.content,
+          m.sender_name,
+          m.timestamp,
+          m.message_type
+        FROM messages m
+        WHERE m.group_id = ?
+        AND m.timestamp BETWEEN datetime(?, '-${contextHours} hours') AND datetime(?, '+${contextHours} hours')
+        AND m.content IS NOT NULL
+        AND m.content != ''
+        ORDER BY m.timestamp ASC
+      `;
+      
+      return new Promise((resolve, reject) => {
+        this.db.all(sql, [groupId, targetDate, targetDate], (err, rows) => {
+          if (err) {
+            logger.error('Error getting conversation context:', err.message);
+            reject(err);
+          } else {
+            resolve(rows || []);
+          }
+        });
+      });
+    } catch (error) {
+      logger.error('Error in getConversationContext:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get popular topics/keywords from group messages
+   */
+  async getPopularTopics(groupId, days = 30, minLength = 4) {
+    try {
+      const sql = `
+        SELECT 
+          m.content,
+          COUNT(*) as frequency,
+          MIN(m.timestamp) as first_mention,
+          MAX(m.timestamp) as last_mention
+        FROM messages m
+        WHERE m.group_id = ?
+        AND m.timestamp > datetime('now', '-${days} days')
+        AND m.content IS NOT NULL
+        AND LENGTH(m.content) >= ?
+        AND m.content NOT LIKE '!%'
+        GROUP BY LOWER(TRIM(m.content))
+        HAVING COUNT(*) > 1
+        ORDER BY frequency DESC
+        LIMIT 20
+      `;
+      
+      return new Promise((resolve, reject) => {
+        this.db.all(sql, [groupId, minLength], (err, rows) => {
+          if (err) {
+            logger.error('Error getting popular topics:', err.message);
+            reject(err);
+          } else {
+            resolve(rows || []);
+          }
+        });
+      });
+    } catch (error) {
+      logger.error('Error in getPopularTopics:', error);
+      throw error;
+    }
+  }
+
+  // ===== CONTACT METHODS =====
+
+  /**
+   * Save or update a contact
+   */
+  async upsertContact(contactData) {
+    const sql = `
+      INSERT INTO contacts (id, name, phone_number, is_group, profile_picture_url, status)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = COALESCE(excluded.name, contacts.name),
+        phone_number = COALESCE(excluded.phone_number, contacts.phone_number),
+        is_group = COALESCE(excluded.is_group, contacts.is_group),
+        profile_picture_url = COALESCE(excluded.profile_picture_url, contacts.profile_picture_url),
+        status = COALESCE(excluded.status, contacts.status),
+        last_seen = CURRENT_TIMESTAMP
+    `;
+    
+    const params = [
+      contactData.id,
+      contactData.name || null,
+      contactData.phoneNumber || null,
+      contactData.isGroup ? 1 : 0,
+      contactData.profilePictureUrl || null,
+      contactData.status || null
+    ];
+
+    try {
+      const result = await this.runQuery(sql, params);
+      logger.debug(`Contact upserted: ${contactData.id}`);
+      return result;
+    } catch (error) {
+      logger.error('Failed to upsert contact:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get contact by ID
+   */
+  async getContact(contactId) {
+    const sql = 'SELECT * FROM contacts WHERE id = ?';
+    return await this.getQuery(sql, [contactId]);
+  }
+
+  /**
+   * Search contacts by name or phone
+   */
+  async searchContacts(searchTerm, limit = 20) {
+    const sql = `
+      SELECT * FROM contacts 
+      WHERE name LIKE ? OR phone_number LIKE ?
+      ORDER BY last_seen DESC
+      LIMIT ?
+    `;
+    const pattern = `%${searchTerm}%`;
+    return await this.allQuery(sql, [pattern, pattern, limit]);
+  }
+
+  // ===== CHAT METADATA METHODS =====
+
+  /**
+   * Save or update chat metadata
+   */
+  async upsertChatMetadata(chatData) {
+    const sql = `
+      INSERT INTO chat_metadata 
+      (id, name, chat_type, description, participant_count, creation_time, 
+       is_active, last_activity, archive_status, pinned, muted, owner_id,
+       subject_changed_at, subject_changed_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = COALESCE(excluded.name, chat_metadata.name),
+        description = COALESCE(excluded.description, chat_metadata.description),
+        participant_count = COALESCE(excluded.participant_count, chat_metadata.participant_count),
+        is_active = COALESCE(excluded.is_active, chat_metadata.is_active),
+        last_activity = COALESCE(excluded.last_activity, chat_metadata.last_activity),
+        archive_status = COALESCE(excluded.archive_status, chat_metadata.archive_status),
+        pinned = COALESCE(excluded.pinned, chat_metadata.pinned),
+        muted = COALESCE(excluded.muted, chat_metadata.muted),
+        owner_id = COALESCE(excluded.owner_id, chat_metadata.owner_id),
+        subject_changed_at = COALESCE(excluded.subject_changed_at, chat_metadata.subject_changed_at),
+        subject_changed_by = COALESCE(excluded.subject_changed_by, chat_metadata.subject_changed_by),
+        updated_at = CURRENT_TIMESTAMP
+    `;
+    
+    const params = [
+      chatData.id,
+      chatData.name,
+      chatData.chatType || 'private',
+      chatData.description || null,
+      chatData.participantCount || 0,
+      chatData.creationTime || null,
+      chatData.isActive !== undefined ? (chatData.isActive ? 1 : 0) : 1,
+      chatData.lastActivity || null,
+      chatData.archiveStatus ? 1 : 0,
+      chatData.pinned ? 1 : 0,
+      chatData.muted ? 1 : 0,
+      chatData.ownerId || null,
+      chatData.subjectChangedAt || null,
+      chatData.subjectChangedBy || null
+    ];
+
+    try {
+      const result = await this.runQuery(sql, params);
+      logger.debug(`Chat metadata upserted: ${chatData.id}`);
+      return result;
+    } catch (error) {
+      logger.error('Failed to upsert chat metadata:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get chat metadata by ID
+   */
+  async getChatMetadata(chatId) {
+    const sql = 'SELECT * FROM chat_metadata WHERE id = ?';
+    return await this.getQuery(sql, [chatId]);
+  }
+
+  /**
+   * Get active chats ordered by last activity
+   */
+  async getActiveChats(limit = 50) {
+    const sql = `
+      SELECT * FROM chat_metadata 
+      WHERE is_active = 1 
+      ORDER BY last_activity DESC 
+      LIMIT ?
+    `;
+    return await this.allQuery(sql, [limit]);
+  }
+
+  /**
+   * Update chat last activity
+   */
+  async updateChatActivity(chatId, timestamp) {
+    const sql = 'UPDATE chat_metadata SET last_activity = ? WHERE id = ?';
+    return await this.runQuery(sql, [timestamp, chatId]);
+  }
+
+  // ===== HISTORY SYNC STATISTICS =====
+
+  /**
+   * Update bot stats with history sync count
+   */
+  async updateHistorySyncStats(count) {
+    const today = new Date().toISOString().split('T')[0];
+    const sql = `
+      INSERT INTO bot_stats (stat_date, history_sync_count)
+      VALUES (?, ?)
+      ON CONFLICT(stat_date) DO UPDATE SET
+        history_sync_count = history_sync_count + excluded.history_sync_count
+    `;
+    return await this.runQuery(sql, [today, count]);
+  }
+
+  // ===== ADVANCED HISTORY QUERIES =====
+
+  /**
+   * Get messages from a specific date range
+   */
+  async getMessagesByDateRange(groupId, startDate, endDate) {
+    const sql = `
+      SELECT m.*, g.name as group_name
+      FROM messages m
+      JOIN groups g ON m.group_id = g.id
+      WHERE m.group_id = ? 
+        AND m.timestamp BETWEEN ? AND ?
+      ORDER BY m.timestamp ASC
+    `;
+    
+    return await this.allQuery(sql, [
+      groupId,
+      startDate.toISOString(),
+      endDate.toISOString()
+    ]);
+  }
+
+  /**
+   * Search messages by content
+   */
+  async searchMessagesContent(groupId, searchTerm) {
+    const sql = `
+      SELECT m.*, g.name as group_name
+      FROM messages m
+      JOIN groups g ON m.group_id = g.id
+      WHERE m.group_id = ? 
+        AND m.content LIKE ?
+        AND m.message_type = 'text'
+      ORDER BY m.timestamp DESC
+      LIMIT 50
+    `;
+    
+    return await this.allQuery(sql, [groupId, `%${searchTerm}%`]);
+  }
+
+  /**
+   * Get activity timeline for group
+   */
+  async getActivityTimeline(groupId, days) {
+    const sql = `
+      SELECT 
+        DATE(timestamp) as date,
+        COUNT(*) as count,
+        COUNT(DISTINCT sender_id) as active_users
+      FROM messages
+      WHERE group_id = ?
+        AND timestamp >= datetime('now', '-${days} days')
+      GROUP BY DATE(timestamp)
+      ORDER BY date DESC
+    `;
+    
+    return await this.allQuery(sql, [groupId]);
+  }
+
+  /**
+   * Get peak hour for group activity
+   */
+  async getPeakHour(groupId, days) {
+    const sql = `
+      SELECT 
+        CAST(strftime('%H', timestamp) AS INTEGER) as hour,
+        COUNT(*) as count
+      FROM messages
+      WHERE group_id = ?
+        AND timestamp >= datetime('now', '-${days} days')
+      GROUP BY hour
+      ORDER BY count DESC
+      LIMIT 1
+    `;
+    
+    const result = await this.getQuery(sql, [groupId]);
+    return result;
+  }
+
+  /**
+   * Get comprehensive group statistics
+   */
+  async getComprehensiveGroupStats(groupId) {
+    const now = new Date();
+    const weekAgo = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+
+    // Total messages
+    const totalMessages = await this.getQuery(`
+      SELECT COUNT(*) as count FROM messages WHERE group_id = ?
+    `, [groupId]);
+
+    // Active users count
+    const activeUsers = await this.getQuery(`
+      SELECT COUNT(DISTINCT sender_id) as count 
+      FROM messages 
+      WHERE group_id = ? AND timestamp >= datetime('now', '-30 days')
+    `, [groupId]);
+
+    // Weekly messages
+    const weekMessages = await this.getQuery(`
+      SELECT COUNT(*) as count 
+      FROM messages 
+      WHERE group_id = ? AND timestamp >= datetime('now', '-7 days')
+    `, [groupId]);
+
+    // Top users
+    const topUsers = await this.allQuery(`
+      SELECT sender_name as name, COUNT(*) as count
+      FROM messages
+      WHERE group_id = ? AND timestamp >= datetime('now', '-30 days')
+      GROUP BY sender_id, sender_name
+      ORDER BY count DESC
+      LIMIT 10
+    `, [groupId]);
+
+    // Peak hours
+    const peakHours = await this.allQuery(`
+      SELECT 
+        CAST(strftime('%H', timestamp) AS INTEGER) as hour,
+        COUNT(*) as count
+      FROM messages
+      WHERE group_id = ? AND timestamp >= datetime('now', '-30 days')
+      GROUP BY hour
+      ORDER BY count DESC
+      LIMIT 5
+    `, [groupId]);
+
+    // Oldest message
+    const oldestMessage = await this.getQuery(`
+      SELECT MIN(timestamp) as oldest FROM messages WHERE group_id = ?
+    `, [groupId]);
+
+    // Calculate daily average
+    const firstMessageDate = oldestMessage?.oldest ? new Date(oldestMessage.oldest) : new Date();
+    const daysSinceFirst = Math.max(1, Math.floor((now - firstMessageDate) / (24 * 60 * 60 * 1000)));
+    const dailyAverage = totalMessages ? totalMessages.count / daysSinceFirst : 0;
+
+    return {
+      total_messages: totalMessages?.count || 0,
+      active_users: activeUsers?.count || 0,
+      week_messages: weekMessages?.count || 0,
+      daily_average: dailyAverage,
+      top_users: topUsers || [],
+      peak_hours: peakHours || [],
+      oldest_message: oldestMessage?.oldest || null
+    };
   }
 
   /**

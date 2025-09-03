@@ -71,8 +71,6 @@ class WhatsAppBot {
 
       // Initialize conversation handler
       await this.conversationHandler.initialize();
-      // Set bot instance for message sending functionality
-      this.conversationHandler.setBotInstance(this);
       logger.info('🤖 מערכת שיחה טבעית אותחלה');
       
       // Get latest Baileys version
@@ -126,15 +124,6 @@ class WhatsAppBot {
       // Handle groups updates
       this.socket.ev.on('groups.upsert', (groups) => {
         logger.info(`📊 עודכנו ${groups.length} קבוצות`);
-        
-        // Only show this tip for new users (first time setup)
-        if (groups.length > 0 && groups.length < 10) {
-          console.log('\n🎯 ========== SETUP TIP ==========');
-          console.log('To see all your groups and set up management group:');
-          console.log('Send !mygroups in any WhatsApp group');
-          console.log('==================================\n');
-        }
-        
         this.handleGroupsUpdate(groups);
       });
 
@@ -444,20 +433,6 @@ class WhatsAppBot {
           const senderId = message.key.participant || message.key.remoteJid;
           const senderName = message.pushName || senderId.split('@')[0];
           
-          // Only log group ID on first message from each group (for setup)
-          if (groupId.includes('@g.us') && !this.loggedGroups?.has(groupId)) {
-            if (!this.loggedGroups) this.loggedGroups = new Set();
-            this.loggedGroups.add(groupId);
-            
-            const groupInfo = await this.db.getGroup(groupId);
-            if (groupInfo) {
-              console.log(`\n🆕 New group detected:`);
-              console.log(`   Group Name: ${groupInfo.name}`);
-              console.log(`   Group ID: ${groupId}`);
-              console.log(`   ────────────────────────`);
-            }
-          }
-          
           if (text?.startsWith('!')) {
             // פקודות קיימות
             logger.info(`📝 פקודה התקבלה: ${text}`);
@@ -475,29 +450,6 @@ class WhatsAppBot {
   }
 
   /**
-   * Extract and save contact information from private message (without saving content)
-   */
-  async saveContactFromPrivateMessage(message) {
-    try {
-      const contactJid = message.key.remoteJid;
-      const contactName = message.pushName;
-      const phoneNumber = contactJid.split('@')[0];
-      
-      if (contactName && contactName.trim() && contactName !== phoneNumber) {
-        // Save only the contact info, not the message content
-        await this.db.saveContact({
-          name: contactName.trim(),
-          phone_number: contactJid
-        });
-        
-        logger.debug(`👤 נשמר איש קשר מהודעה פרטית: ${contactName}`);
-      }
-    } catch (error) {
-      logger.debug('Failed to save contact from private message:', error);
-    }
-  }
-
-  /**
    * Process and save message to database
    */
   async processAndSaveMessage(message) {
@@ -505,13 +457,7 @@ class WhatsAppBot {
     const messageId = message.key.id;
     const senderId = message.key.participant || message.key.remoteJid;
     
-    // Handle private messages - extract contact info only (no message content)
-    if (groupId?.endsWith('@s.whatsapp.net')) {
-      await this.saveContactFromPrivateMessage(message);
-      return; // Don't save the actual message content for privacy
-    }
-    
-    // Only process group messages for full message saving
+    // Only process group messages
     if (!groupId?.endsWith('@g.us')) return;
     
     // Extract message content
@@ -969,9 +915,6 @@ class WhatsAppBot {
       
       // Handle single-word commands (both local and from ניצן)
       switch (cmd) {
-        case '!mygroups':
-          await this.handleMyGroups(message);
-          break;
         case '!status':
           await this.sendStatusMessage(groupId);
           break;
@@ -1079,7 +1022,6 @@ class WhatsAppBot {
 📝 *!summary* - סיכום הודעות חדשות (מאז סיכום אחרון)
 🗓️ *!today* - סיכום כל הודעות היום (מ-00:00)
 🧪 *!test* - בדיקת חיבור ל-AI
-🏠 *!mygroups* - רשימת כל הקבוצות שלך עם ה-IDs להגדרות
 
 🔍 *היסטוריה וחיפוש:*
 📜 *!history [תקופה]* - סיכום מתקופה (yesterday/week/month/YYYY-MM-DD)
@@ -2773,7 +2715,7 @@ ${analysisResult.analysis}
 
       logger.info(`📊 מייצר סיכום תאריך עבור ${period} (${messages.length} הודעות)`);
       
-      // Generate summary using AI Agent
+      // Generate summary using the existing SummaryService
       const currentGroupName = targetGroupName || (await this.db.getQuery('SELECT name FROM groups WHERE id = ?', [targetGroupId]))?.name || 'הקבוצה';
       const summaryQuery = `צור סיכום של ${messages.length} הודעות מקבוצת "${currentGroupName}". הנה ההודעות:\n\n${messages.map(m => `${m.sender}: ${m.body}`).join('\n')}`;
       const result = await this.conversationHandler.processNaturalQuery(summaryQuery, null, 'system', false);
@@ -3127,8 +3069,8 @@ ${analysisResult.analysis}
         messageKey: message.key
       };
       
-      // עיבוד השאלה עם ConversationHandler - כולל פרמטרי לוגינג
-      const response = await this.conversationHandler.processNaturalQuery(text, groupId, 'user', false, senderId, senderName);
+      // עיבוד השאלה עם ConversationHandler
+      const response = await this.conversationHandler.processNaturalQuery(text, context);
       
       // שליחת התשובה לקבוצה
       await this.socket.sendMessage(groupId, { 
@@ -3184,87 +3126,6 @@ ${analysisResult.analysis}
       
     } catch (error) {
       logger.error('Failed to save conversation context:', error);
-    }
-  }
-
-  /**
-   * Handle !mygroups command - Show all groups with their IDs for configuration
-   */
-  async handleMyGroups(message) {
-    const groupId = message.key.remoteJid;
-    
-    try {
-      logger.info('📋 [MY GROUPS] Fetching all connected groups');
-      
-      // Get all active groups from database
-      const groups = await this.db.allQuery(`
-        SELECT 
-          g.id,
-          g.name,
-          COUNT(m.id) as message_count,
-          MAX(m.timestamp) as last_message_time
-        FROM groups g
-        LEFT JOIN messages m ON g.id = m.group_id
-        WHERE g.is_active = 1
-        GROUP BY g.id, g.name
-        ORDER BY message_count DESC
-      `);
-      
-      if (!groups || groups.length === 0) {
-        await this.socket.sendMessage(groupId, {
-          text: '❌ לא נמצאו קבוצות פעילות'
-        });
-        return;
-      }
-      
-      // Build response message
-      let response = `🏠 *רשימת הקבוצות שלך (${groups.length} קבוצות):*\n\n`;
-      response += `⚠️ *חשוב - הגדרות ראשוניות:*\n`;
-      response += `1. בחר *קבוצת ניהול אחת* (כמו "Nitzan bot")\n`;
-      response += `2. העתק את ה-ID שלה\n`;
-      response += `3. החלף את ה-ID ב-*3 מקומות*:\n`;
-      response += `   • src/services/DatabaseAgentTools.js (שורה 756)\n`;
-      response += `   • src/bot.js - חפש "summaryTargetGroupId"\n`;
-      response += `   • src/bot.js - שורה ~3106 "conversationGroupId" (לשיחות AI!)\n\n`;
-      response += `💡 *הקבוצה הזו תוכל:*\n`;
-      response += `• לשלוח פקודות לקבוצות אחרות\n`;
-      response += `• לקבל סיכומים אוטומטיים\n`;
-      response += `• לנהל את הבוט\n\n`;
-      response += `📊 *הקבוצות שלך:*\n`;
-      response += `────────────────────────\n\n`;
-      
-      // Add groups to response
-      groups.forEach((group, index) => {
-        const lastMessageDate = group.last_message_time ? 
-          new Date(group.last_message_time).toLocaleDateString('he-IL') : 
-          'אין הודעות';
-        
-        response += `${index + 1}. *${group.name}*\n`;
-        response += `   📱 ID: \`${group.id}\`\n`;
-        response += `   💬 הודעות: ${group.message_count || 0}\n`;
-        response += `   ⏰ הודעה אחרונה: ${lastMessageDate}\n`;
-        response += `   ────────────────\n`;
-      });
-      
-      response += `\n💡 *טיפ:* לחץ על ה-ID כדי להעתיק אותו`;
-      
-      // Also log to console for easy copying
-      console.log('\n🏠 ========== YOUR GROUPS ==========');
-      groups.forEach((group, index) => {
-        console.log(`${index + 1}. ${group.name}`);
-        console.log(`   ID: ${group.id}`);
-        console.log(`   Messages: ${group.message_count || 0}`);
-        console.log('   ─────────────────────────');
-      });
-      console.log('===================================\n');
-      
-      await this.socket.sendMessage(groupId, { text: response });
-      
-    } catch (error) {
-      logger.error('Error in handleMyGroups:', error);
-      await this.socket.sendMessage(groupId, {
-        text: '❌ שגיאה בקבלת רשימת הקבוצות'
-      });
     }
   }
 }

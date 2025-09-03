@@ -4,7 +4,7 @@ module.exports = {
   // OpenRouter API Configuration
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY,
-    model: process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet',
+    model: 'anthropic/claude-3.5-sonnet',
     baseURL: 'https://openrouter.ai/api/v1'
   },
 
@@ -50,9 +50,11 @@ module.exports = {
   // Baileys Configuration
   baileys: {
     printQRInTerminal: true,
-    browser: ['WhatsApp Group Bot', 'Desktop', '1.0.0'],
-    syncFullHistory: false,
+    browser: ['WhatsApp Bot Desktop', 'Desktop', '1.0.0'], // Enhanced desktop emulation
+    syncFullHistory: true,  // Enable full history sync
     markOnlineOnConnect: false,
-    defaultQueryTimeoutMs: 60000
+    defaultQueryTimeoutMs: 60000,
+    shouldSyncHistoryMessage: () => true,  // Accept all history messages
+    maxHistoryMessages: 1000  // Increase history message limit
   }
 };

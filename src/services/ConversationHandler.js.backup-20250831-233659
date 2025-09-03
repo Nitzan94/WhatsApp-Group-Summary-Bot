@@ -2,15 +2,6 @@ const OpenAI = require('openai');
 const logger = require('../utils/logger');
 const config = require('../../config/bot-config');
 const DatabaseAgentTools = require('./DatabaseAgentTools');
-const {
-  logConversationStart,
-  logToolExecution,
-  logDatabaseSearch,
-  logAIResponse,
-  logConversationEnd,
-  logDataInsights,
-  generateSessionId
-} = require('../utils/agentLogger');
 
 /**
  * ConversationHandler - הליבה החדשה לשיחה טבעית
@@ -57,54 +48,21 @@ class ConversationHandler {
   }
 
   /**
-   * Set bot instance for message sending functionality
-   */
-  setBotInstance(botInstance) {
-    this.botInstance = botInstance;
-    this.dbTools.setBotInstance(botInstance);
-    logger.info('🔗 Bot instance set for ConversationHandler and DatabaseAgentTools');
-  }
-
-  /**
    * עיבוד שאלות טבעיות - הפונקציה המרכזית עם AI Agent
    */
-  async processNaturalQuery(question, groupId = null, userType = 'user', forceGroupQuery = false, userId = null, userName = null) {
-    const sessionId = generateSessionId();
-    const startTime = Date.now();
-    let success = false;
-    let error = null;
-    
+  async processNaturalQuery(question, groupId = null, userType = 'user', forceGroupQuery = false) {
     try {
+      const startTime = Date.now();
       logger.info(`🤖 [AI AGENT] עיבוד שאלה: "${question.substring(0, 100)}..."`);
       
-      // Get group info for logging
-      let groupName = null;
-      if (groupId) {
-        try {
-          const groupInfo = await this.db.getQuery('SELECT name FROM groups WHERE id = ?', [groupId]);
-          groupName = groupInfo?.name || 'Unknown Group';
-        } catch (err) {
-          groupName = 'Unknown Group';
-        }
-      }
-      
-      // Log conversation start
-      logConversationStart(sessionId, question, userId || 'Unknown User', groupId, groupName);
-      
       // Build context from parameters
-      const context = { groupId, userType, forceGroupQuery, sessionId };
-      
-      // Set context for DatabaseAgentTools (for permission checking)
-      this.dbTools.setContext(context);
+      const context = { groupId, userType, forceGroupQuery };
       
       // שליחה ל-AI כ-Agent עם כלי מסד נתונים
       const response = await this.queryAIAgent(question, context);
       
       const duration = Date.now() - startTime;
       logger.info(`✅ [AI AGENT] שאלה עובדה תוך ${duration}ms`);
-      
-      success = true;
-      logConversationEnd(sessionId, true, null, duration);
       
       // Return structured response only for SchedulerService (when userType is 'system')
       // For regular users, return plain string
@@ -121,10 +79,6 @@ class ConversationHandler {
       
     } catch (error) {
       logger.error('Error processing natural query with AI Agent:', error);
-      
-      // Log conversation error  
-      const duration = Date.now() - startTime;
-      logConversationEnd(sessionId, false, error, duration);
       
       // Return structured response for system calls, plain error message for users
       if (userType === 'system') {
@@ -377,7 +331,6 @@ class ConversationHandler {
    * שליחת שאלה לAI כ-Agent עם כלי מסד נתונים
    */
   async queryAIAgent(question, context = {}) {
-    const startTime = Date.now();
     try {
       const systemPrompt = this.buildSystemPromptForAgent();
       const tools = this.dbTools.createToolDefinitions();
@@ -416,16 +369,10 @@ class ConversationHandler {
         // ביצוע כל ה-tool calls
         for (const toolCall of toolCalls) {
           const { name, arguments: args, id } = toolCall.function;
-          const toolStartTime = Date.now();
           
           try {
             logger.info(`🛠️ [AI AGENT] Executing tool: ${name}`);
-            const parsedArgs = JSON.parse(args);
-            const toolResult = await this.dbTools.executeTool(name, parsedArgs);
-            const toolExecutionTime = Date.now() - toolStartTime;
-            
-            // Log detailed tool execution
-            logToolExecution(context.sessionId, name, parsedArgs, toolResult, toolExecutionTime);
+            const toolResult = await this.dbTools.executeTool(name, JSON.parse(args));
             
             // הוספת תוצאת ה-tool
             messages.push({
@@ -435,12 +382,7 @@ class ConversationHandler {
             });
             
           } catch (error) {
-            const toolExecutionTime = Date.now() - toolStartTime;
             logger.error(`Error executing tool ${name}:`, error);
-            
-            // Log failed tool execution
-            logToolExecution(context.sessionId, name, JSON.parse(args || '{}'), { error: error.message }, toolExecutionTime);
-            
             messages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
@@ -466,10 +408,6 @@ class ConversationHandler {
       }
       
       finalAnswer = response.choices[0]?.message?.content || 'לא הצלחתי לקבל תשובה מהמערכת';
-      
-      // Log AI response
-      const totalTime = Date.now() - startTime;
-      logAIResponse(context.sessionId, finalAnswer, toolCallsCount, totalTime);
       
       logger.info(`🤖 [AI AGENT] Completed with ${toolCallsCount} tool call rounds`);
       return finalAnswer;
@@ -531,7 +469,6 @@ class ConversationHandler {
 - search_messages_in_group: חיפוש הודעות בקבוצה ספציפית
 - get_recent_messages: קבלת הודעות אחרונות מקבוצה
 - get_messages_by_date: קבלת הודעות מתאריך ספציפי
-- send_message_to_group: שליחת הודעה לקבוצת WhatsApp אחרת (רק מקבוצת Nitzan bot)
 
 📋 **אסטרטגיית העבודה:**
 1. **הבן את השאלה** - מה המשתמש רוצה לדעת?
@@ -551,7 +488,6 @@ class ConversationHandler {
 - "מה קרה אתמול בקבוצת חדשות טכנולוגיה?" → חפש קבוצה → קבל הודעות מאתמול → סכם
 - "חפש לי מידע על AI בכל הקבוצות" → חפש "AI" בכל מקום → סכם ממצאים
 - "תן לי עדכון מהקבוצה של ניצן" → מצא קבוצת ניצן → קבל הודעות אחרונות → סכם
-- "תשלח לקבוצת הילדים הודעה שהגעתי" → השתמש בsend_message_to_group → שלח הודעה
 
 זכור: אתה Agent עצמאי שיכול לחפש ולנתח. השתמש בכלים שלך בחכמה!`;
   }

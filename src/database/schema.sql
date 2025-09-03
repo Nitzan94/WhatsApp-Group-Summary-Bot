@@ -53,6 +53,39 @@ CREATE TABLE IF NOT EXISTS summary_triggers (
     FOREIGN KEY (summary_id) REFERENCES summaries(id) ON DELETE CASCADE
 );
 
+-- Contacts table - store contact information from history sync
+CREATE TABLE IF NOT EXISTS contacts (
+    id TEXT PRIMARY KEY,                    -- WhatsApp contact ID (e.g., "972123456789@c.us")
+    name TEXT,                              -- Display name of contact
+    phone_number TEXT,                      -- Phone number
+    is_group BOOLEAN DEFAULT 0,             -- Is this contact actually a group
+    profile_picture_url TEXT,               -- Profile picture URL if available
+    status TEXT,                            -- WhatsApp status if available
+    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Chat metadata table - store enhanced chat information from history sync
+CREATE TABLE IF NOT EXISTS chat_metadata (
+    id TEXT PRIMARY KEY,                    -- Chat ID (group or contact ID)
+    name TEXT NOT NULL,                     -- Display name
+    chat_type TEXT DEFAULT 'private',       -- 'private', 'group', 'broadcast'
+    description TEXT,                       -- Group description if available
+    participant_count INTEGER DEFAULT 0,    -- Number of participants (for groups)
+    creation_time DATETIME,                 -- When the chat was created
+    is_active BOOLEAN DEFAULT 1,            -- Whether the chat is active
+    last_activity DATETIME,                 -- Last message timestamp
+    archive_status BOOLEAN DEFAULT 0,       -- Is chat archived
+    pinned BOOLEAN DEFAULT 0,               -- Is chat pinned
+    muted BOOLEAN DEFAULT 0,                -- Is chat muted
+    owner_id TEXT,                          -- Group owner ID (for groups)
+    subject_changed_at DATETIME,            -- When group subject was last changed
+    subject_changed_by TEXT,                -- Who changed the group subject
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Bot stats table - track bot usage and performance
 CREATE TABLE IF NOT EXISTS bot_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +95,7 @@ CREATE TABLE IF NOT EXISTS bot_stats (
     api_calls INTEGER DEFAULT 0,           -- OpenRouter API calls today
     uptime_minutes INTEGER DEFAULT 0,       -- Minutes the bot was running
     errors_count INTEGER DEFAULT 0,        -- Number of errors today
+    history_sync_count INTEGER DEFAULT 0,   -- Messages synced from history today
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -71,11 +105,31 @@ CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_summaries_group_created ON summaries(group_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_groups_active ON groups(is_active);
 
+-- New indexes for history sync tables
+CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone_number);
+CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);
+CREATE INDEX IF NOT EXISTS idx_contacts_last_seen ON contacts(last_seen);
+CREATE INDEX IF NOT EXISTS idx_chat_metadata_type ON chat_metadata(chat_type);
+CREATE INDEX IF NOT EXISTS idx_chat_metadata_activity ON chat_metadata(last_activity);
+CREATE INDEX IF NOT EXISTS idx_chat_metadata_active ON chat_metadata(is_active);
+
 -- Triggers to update timestamps
 CREATE TRIGGER IF NOT EXISTS update_groups_timestamp 
     AFTER UPDATE ON groups
     BEGIN
         UPDATE groups SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS update_chat_metadata_timestamp 
+    AFTER UPDATE ON chat_metadata
+    BEGIN
+        UPDATE chat_metadata SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS update_contacts_last_seen 
+    AFTER UPDATE ON contacts
+    BEGIN
+        UPDATE contacts SET last_seen = CURRENT_TIMESTAMP WHERE id = NEW.id;
     END;
 
 -- Views for easy querying
@@ -106,3 +160,104 @@ FROM groups g
 LEFT JOIN summaries s ON g.id = s.group_id
 WHERE g.is_active = 1
 GROUP BY g.id, g.name;
+
+-- =====================================================
+-- Natural Language Conversation Extensions
+-- =====================================================
+
+-- Conversation context table - זיכרון קצר מועד לשיחות
+CREATE TABLE IF NOT EXISTS conversation_context (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,                 -- קבוצה בה מתקיימת השיחה
+    user_id TEXT NOT NULL,                  -- משתמש ששואל
+    last_question TEXT,                     -- השאלה האחרונה
+    last_response TEXT,                     -- התשובה האחרונה
+    context_data TEXT,                      -- JSON עם הקשר נוסף
+    search_results_count INTEGER DEFAULT 0, -- כמה תוצאות נמצאו
+    ai_model_used TEXT,                     -- איזה מודל AI נוצל
+    response_time_ms INTEGER,               -- זמן תגובה במילישניות
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME DEFAULT (datetime('now', '+1 hour')), -- פג תוקף אחרי שעה
+    
+    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+);
+
+-- FTS5 Virtual Table - חיפוש מהיר בכל ההודעות
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,                                -- תוכן ההודעה
+    sender_name,                            -- שם השולח
+    group_name,                             -- שם הקבוצה
+    message_type,                           -- סוג ההודעה
+    content=messages,                       -- טבלת המקור
+    content_rowid=id,                       -- קישור לטבלת המקור
+    tokenize='unicode61 remove_diacritics 1' -- תמיכה בעברית משופרת
+);
+
+-- טבלת סטטיסטיקות חיפוש ושיחות
+CREATE TABLE IF NOT EXISTS conversation_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stat_date DATE NOT NULL UNIQUE,        -- תאריך הסטטיסטיקה
+    natural_queries INTEGER DEFAULT 0,     -- מספר שאלות טבעיות
+    fts_searches INTEGER DEFAULT 0,        -- מספר חיפושי FTS
+    avg_response_time_ms INTEGER DEFAULT 0, -- זמן תגובה ממוצע
+    avg_results_count INTEGER DEFAULT 0,   -- מספר תוצאות ממוצע
+    successful_queries INTEGER DEFAULT 0,   -- שאלות שהצליחו
+    failed_queries INTEGER DEFAULT 0,      -- שאלות שנכשלו
+    total_ai_tokens INTEGER DEFAULT 0,     -- סך האסימונים שנוצלו
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- אינדקסים לביצועים מיטביים
+CREATE INDEX IF NOT EXISTS idx_conversation_context_group ON conversation_context(group_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_context_user ON conversation_context(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_context_expires ON conversation_context(expires_at);
+CREATE INDEX IF NOT EXISTS idx_conversation_stats_date ON conversation_stats(stat_date);
+
+-- Triggers לניקוי אוטומטי של זיכרון ישן
+CREATE TRIGGER IF NOT EXISTS cleanup_expired_context
+    AFTER INSERT ON conversation_context
+    BEGIN
+        DELETE FROM conversation_context 
+        WHERE expires_at < datetime('now');
+    END;
+
+-- Trigger לעדכון סטטיסטיקות יומיות
+CREATE TRIGGER IF NOT EXISTS update_daily_stats
+    AFTER INSERT ON conversation_context
+    BEGIN
+        INSERT OR REPLACE INTO conversation_stats (
+            stat_date, 
+            natural_queries,
+            avg_response_time_ms,
+            avg_results_count,
+            successful_queries,
+            failed_queries
+        )
+        SELECT 
+            date('now') as stat_date,
+            COUNT(*) as natural_queries,
+            AVG(response_time_ms) as avg_response_time_ms,
+            AVG(search_results_count) as avg_results_count,
+            SUM(CASE WHEN last_response IS NOT NULL AND last_response != '' THEN 1 ELSE 0 END) as successful_queries,
+            SUM(CASE WHEN last_response IS NULL OR last_response = '' THEN 1 ELSE 0 END) as failed_queries
+        FROM conversation_context
+        WHERE date(created_at) = date('now');
+    END;
+
+-- View מאוחד לסטטיסטיקות מקיפות
+CREATE VIEW IF NOT EXISTS bot_overview_stats AS
+SELECT 
+    bs.stat_date,
+    bs.messages_processed,
+    bs.summaries_generated,
+    bs.api_calls,
+    bs.uptime_minutes,
+    bs.errors_count,
+    cs.natural_queries,
+    cs.avg_response_time_ms,
+    cs.successful_queries,
+    cs.failed_queries,
+    (CAST(cs.successful_queries AS REAL) / NULLIF(cs.natural_queries, 0) * 100) as success_rate_percent
+FROM bot_stats bs
+LEFT JOIN conversation_stats cs ON bs.stat_date = cs.stat_date
+ORDER BY bs.stat_date DESC;

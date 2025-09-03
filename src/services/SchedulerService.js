@@ -1,37 +1,46 @@
 const cron = require('node-cron');
+const fs = require('fs').promises;
+const path = require('path');
+const chokidar = require('chokidar');
 const logger = require('../utils/logger');
+const ScheduleParser = require('./ScheduleParser');
 
 class SchedulerService {
-  constructor(bot, db) {
+  constructor(bot, db, conversationHandler = null) {
     this.bot = bot;
     this.db = db;
-    this.activeCronJobs = new Map(); // Map of groupId -> cron job
+    this.conversationHandler = conversationHandler;
+    this.activeCronJobs = new Map(); // Map of schedule id -> cron job
+    this.scheduleParser = new ScheduleParser();
+    this.schedules = [];
+    this.schedulesPath = path.join(__dirname, '../../schedules');
     this.isInitialized = false;
+    this.fileWatcher = null;
   }
 
   /**
-   * Initialize scheduler service and load existing schedules
+   * Initialize scheduler service and load schedules from files
    */
   async initialize() {
     try {
-      logger.info('🕒 מאתחל מערכת תזמונים...');
+      logger.info('🕒 מאתחל מערכת תזמונים חדשה עם AI Agent...');
       
-      // Load all active schedules from database
-      const groups = await this.db.getActiveGroups();
-      let scheduledCount = 0;
-      
-      for (const group of groups) {
-        if (group.schedule && this.isValidCronSchedule(group.schedule)) {
-          await this.scheduleGroup(group.id, group.schedule);
-          scheduledCount++;
-        }
+      // Validate conversationHandler availability
+      if (!this.conversationHandler) {
+        logger.warn('⚠️ ConversationHandler לא זמין - סיכומים מתוזמנים לא יעבדו');
       }
       
-      // Schedule daily cleanup at 02:00
-      await this.scheduleDailyCleanup();
+      // Load schedules from files
+      await this.loadSchedulesFromFiles();
+      
+      // Set up file watching for hot reload
+      this.setupFileWatching();
+      
+      // Schedule daily cleanup at 02:00 - DISABLED TO KEEP ALL MESSAGES
+      // await this.scheduleDailyCleanup();
       
       this.isInitialized = true;
-      logger.info(`✅ מערכת תזמונים הופעלה - ${scheduledCount} תזמונים פעילים`);
+      logger.info(`✅ מערכת תזמונים חדשה הופעלה - ${this.schedules.length} תזמונים נטענו`);
       
     } catch (error) {
       logger.error('Failed to initialize scheduler:', error);
@@ -147,60 +156,275 @@ class SchedulerService {
   }
 
   /**
-   * Execute scheduled summary for a group
+   * Load all schedule files from the schedules directory
    */
-  async executeScheduledSummary(groupId) {
+  async loadSchedulesFromFiles() {
     try {
-      const group = await this.db.getGroup(groupId);
-      if (!group) {
-        logger.error(`Scheduled job for unknown group: ${groupId}`);
-        return;
-      }
-
-      logger.info(`⏰ מבצע סיכום מתוזמן לקבוצת "${group.name}"`);
+      logger.info('📄 טוען קבצי תזמון...');
       
-      // Get today's messages
-      const messages = await this.db.getTodaysMessages(groupId);
+      // Ensure schedules directory exists
+      await fs.mkdir(this.schedulesPath, { recursive: true });
       
-      if (messages.length === 0) {
-        logger.info(`📭 אין הודעות לסיכום בקבוצת "${group.name}"`);
-        return;
-      }
-
-      // Generate summary
-      const result = await this.bot.summaryService.generateSummary(messages, group.name);
+      // Read all .txt files in schedules directory
+      const files = await fs.readdir(this.schedulesPath);
+      const scheduleFiles = files.filter(file => file.endsWith('.txt'));
       
-      if (!result.success) {
-        logger.error(`Failed scheduled summary for "${group.name}": ${result.error}`);
-        return;
+      logger.info(`📂 נמצאו ${scheduleFiles.length} קבצי תזמון`);
+      
+      this.schedules = [];
+      
+      for (const file of scheduleFiles) {
+        const filePath = path.join(this.schedulesPath, file);
+        const parsedSchedules = await this.scheduleParser.parse(filePath);
+        
+        this.schedules.push(...parsedSchedules);
       }
-
-      // Format summary
-      const today = new Date().toLocaleDateString('he-IL');
-      const formattedSummary = `⏰ *סיכום אוטומטי - ${today}*\n*קבוצת ${group.name}*\n\n${result.summary}\n\n📊 *מידע טכני:*\n• הודעות: ${messages.length}\n• מודל: ${result.metadata.model}\n• זמן: ${new Date().toLocaleString('he-IL')}\n\n_סיכום אוטומטי זה הופק באמצעות AI_`;
-
-      // Send summary to target group (ניצן)
-      await this.bot.socket.sendMessage(this.bot.summaryTargetGroupId, {
-        text: formattedSummary
-      });
-
-      // Save summary to database
-      const summaryData = {
-        groupId: groupId,
-        summaryText: result.summary,
-        messagesCount: messages.length,
-        startTime: messages[0]?.timestamp || new Date().toISOString(),
-        endTime: messages[messages.length - 1]?.timestamp || new Date().toISOString(),
-        modelUsed: result.metadata.model,
-        tokensUsed: result.metadata.tokensUsed
-      };
-
-      const summaryId = await this.db.saveSummary(summaryData);
-      logger.info(`✅ סיכום אוטומטי הושלם לקבוצת "${group.name}" (ID: ${summaryId})`);
-
+      
+      // Stop existing jobs
+      this.stopAllJobs();
+      
+      // Start new cron jobs
+      let activeJobs = 0;
+      for (const schedule of this.schedules) {
+        if (await this.createCronJob(schedule)) {
+          activeJobs++;
+        }
+      }
+      
+      logger.info(`✅ נטענו ${this.schedules.length} תזמונים, ${activeJobs} פעילים`);
+      
     } catch (error) {
-      logger.error('Failed to execute scheduled summary:', error);
+      logger.error('Failed to load schedules from files:', error);
+      this.schedules = [];
     }
+  }
+
+  /**
+   * Setup file watching for hot reload of schedules
+   */
+  setupFileWatching() {
+    try {
+      if (this.fileWatcher) {
+        this.fileWatcher.close();
+      }
+      
+      this.fileWatcher = chokidar.watch(
+        path.join(this.schedulesPath, '*.txt'),
+        { 
+          ignoreInitial: true,
+          awaitWriteFinish: {
+            stabilityThreshold: 1000,
+            pollInterval: 100
+          }
+        }
+      );
+      
+      this.fileWatcher.on('add', async (filePath) => {
+        logger.info(`📄 קובץ תזמון חדש נוסף: ${path.basename(filePath)}`);
+        await this.loadSchedulesFromFiles();
+      });
+      
+      this.fileWatcher.on('change', async (filePath) => {
+        logger.info(`📝 קובץ תזמון עודכן: ${path.basename(filePath)}`);
+        await this.loadSchedulesFromFiles();
+      });
+      
+      this.fileWatcher.on('unlink', async (filePath) => {
+        logger.info(`🗑️ קובץ תזמון נמחק: ${path.basename(filePath)}`);
+        await this.loadSchedulesFromFiles();
+      });
+      
+      logger.info('👀 מערכת מעקב קבצים הופעלה');
+      
+    } catch (error) {
+      logger.error('Failed to setup file watching:', error);
+    }
+  }
+
+  /**
+   * Create cron job for a schedule
+   */
+  async createCronJob(schedule) {
+    try {
+      const job = cron.schedule(schedule.cronExpression, async () => {
+        await this.executeSchedule(schedule);
+      }, {
+        scheduled: false,
+        timezone: 'Asia/Jerusalem'
+      });
+      
+      job.start();
+      this.activeCronJobs.set(schedule.id, job);
+      
+      logger.info(`⏰ תזמון הופעל: ${schedule.name} - ${this.scheduleParser.cronToReadable(schedule.cronExpression)}`);
+      return true;
+      
+    } catch (error) {
+      logger.error(`Failed to create cron job for ${schedule.name}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Execute a scheduled task using AI Agent
+   */
+  async executeSchedule(schedule) {
+    try {
+      logger.info(`⏰ מבצע תזמון: ${schedule.name}`);
+      
+      if (!this.conversationHandler) {
+        logger.error('ConversationHandler לא זמין לביצוע תזמון');
+        return;
+      }
+      
+      // Process each group in the schedule
+      for (const groupName of schedule.groups) {
+        await this.executeScheduleForGroup(schedule, groupName);
+      }
+      
+      logger.info(`✅ תזמון הושלם: ${schedule.name}`);
+      
+    } catch (error) {
+      logger.error(`Failed to execute schedule ${schedule.name}:`, error);
+    }
+  }
+
+  /**
+   * Execute schedule for a specific group using AI Agent
+   */
+  async executeScheduleForGroup(schedule, groupName) {
+    try {
+      logger.info(`🤖 מבצע ${schedule.action} עבור קבוצת "${groupName}"`);
+      
+      // Create a natural language query based on the schedule action
+      const query = this.buildNaturalQuery(schedule.action, groupName);
+      
+      logger.debug(`🗣️ שאילתה טבעית: "${query}"`);
+      
+      // Use ConversationHandler to process the query
+      const result = await this.conversationHandler.processNaturalQuery(
+        query,
+        null, // no specific groupId - let AI Agent resolve the group name
+        'system', // system user
+        true // forceGroupQuery to ensure proper context
+      );
+      
+      if (!result || !result.success) {
+        logger.error(`AI Agent failed for ${groupName}: ${result?.error || 'Unknown error'}`);
+        return;
+      }
+      
+      // Format the result for scheduled delivery
+      const scheduledMessage = this.formatScheduledResult(
+        result.response,
+        schedule.name,
+        groupName
+      );
+      
+      // Send to target group/chat
+      await this.sendScheduledMessage(scheduledMessage, schedule.sendTo);
+      
+      logger.info(`✅ תזמון הושלם עבור קבוצת "${groupName}"`);
+      
+    } catch (error) {
+      logger.error(`Failed to execute schedule for group ${groupName}:`, error);
+    }
+  }
+
+  /**
+   * Build natural language query from schedule action
+   */
+  buildNaturalQuery(action, groupName) {
+    // Convert schedule action to natural language query
+    const actionMap = {
+      'daily_summary': `תסכם לי מה היה היום בקבוצת "${groupName}"`,
+      'weekly_summary': `תסכם לי מה היה השבוع בקבוצת "${groupName}"`,
+      'today_summary': `תסכם לי את ההודעות מהיום בקבוצת "${groupName}"`,
+      'summary': `תסכם לי את ההודעות האחרונות בקבוצת "${groupName}"`,
+      'status': `מה המצב בקבוצת "${groupName}"?`,
+      'activity': `איך הפעילות בקבוצת "${groupName}"?`,
+      'latest_message': `מה ההודעה האחרונה בקבוצת "${groupName}"?`
+    };
+    
+    // If action is in the map, use it; otherwise use it as-is with group name
+    return actionMap[action] || `${action} בקבוצת "${groupName}"`;
+  }
+
+  /**
+   * Format AI Agent result for scheduled delivery
+   */
+  formatScheduledResult(response, scheduleName, groupName) {
+    const timestamp = new Date().toLocaleString('he-IL');
+    
+    return `⏰ *תזמון אוטומטי - ${scheduleName}*\n` +
+           `📍 *קבוצת ${groupName}*\n` +
+           `🕐 ${timestamp}\n\n` +
+           `${response}\n\n` +
+           `_תזמון אוטומטי זה הופק באמצעות AI Agent_`;
+  }
+
+  /**
+   * Send scheduled message to target group/chat
+   */
+  async sendScheduledMessage(message, sendTo) {
+    try {
+      // Resolve sendTo to actual WhatsApp ID
+      let targetId = null;
+      
+      if (sendTo === 'ניצן' || sendTo === 'nitzer') {
+        targetId = this.bot.summaryTargetGroupId; // Nitzer's group
+      } else {
+        // Try to find group by name
+        targetId = await this.resolveGroupId(sendTo);
+      }
+      
+      if (!targetId) {
+        logger.error(`לא ניתן למצוא את היעד לשליחה: ${sendTo}`);
+        return false;
+      }
+      
+      await this.bot.socket.sendMessage(targetId, { text: message });
+      logger.info(`📤 הודעה מתוזמנת נשלחה ל-${sendTo}`);
+      return true;
+      
+    } catch (error) {
+      logger.error('Failed to send scheduled message:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Resolve group name to WhatsApp ID
+   */
+  async resolveGroupId(groupName) {
+    try {
+      // Try to find group in database by name
+      const groups = await this.db.allQuery('SELECT id, name FROM groups WHERE is_active = 1');
+      const group = groups.find(g => 
+        g.name.toLowerCase().includes(groupName.toLowerCase()) ||
+        groupName.toLowerCase().includes(g.name.toLowerCase())
+      );
+      
+      return group ? group.id : null;
+    } catch (error) {
+      logger.error('Failed to resolve group ID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Stop all active cron jobs
+   */
+  stopAllJobs() {
+    for (const [id, job] of this.activeCronJobs) {
+      try {
+        job.stop();
+      } catch (error) {
+        logger.error(`Failed to stop job ${id}:`, error);
+      }
+    }
+    this.activeCronJobs.clear();
+    logger.info('⏰ כל התזמונים הופסקו');
   }
 
   /**
@@ -354,14 +578,42 @@ class SchedulerService {
   }
 
   /**
+   * Get all active schedules (for management interface)
+   */
+  getActiveSchedules() {
+    return this.schedules.map(schedule => ({
+      id: schedule.id,
+      name: schedule.name,
+      groups: schedule.groups,
+      action: schedule.action,
+      schedule: schedule.schedule,
+      cronExpression: schedule.cronExpression,
+      readable: this.scheduleParser.cronToReadable(schedule.cronExpression),
+      sendTo: schedule.sendTo,
+      isActive: this.activeCronJobs.has(schedule.id)
+    }));
+  }
+
+  /**
+   * Reload all schedules (for manual refresh)
+   */
+  async reloadSchedules() {
+    logger.info('🔄 רענון ידני של תזמונים...');
+    await this.loadSchedulesFromFiles();
+  }
+
+  /**
    * Stop all scheduled jobs (for cleanup)
    */
   stopAll() {
-    for (const [groupId, job] of this.activeCronJobs) {
-      job.stop();
+    this.stopAllJobs();
+    
+    if (this.fileWatcher) {
+      this.fileWatcher.close();
+      this.fileWatcher = null;
     }
-    this.activeCronJobs.clear();
-    logger.info('⏰ כל התזמונים הופסקו');
+    
+    logger.info('⏰ מערכת תזמונים הופסקה לחלוטין');
   }
 }
 
