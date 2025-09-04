@@ -110,8 +110,8 @@ class ScheduleParser {
           continue;
         }
 
-        // אם אנחנו בסקציית groups, הוסף את השורה כקבוצה
-        if (currentSection === 'groups' && groupsStarted) {
+        // אם אנחנו בסקציית groups, הוסף את השורה כקבוצה (רק אם לא ריקה)
+        if (currentSection === 'groups' && groupsStarted && line.trim().length > 0) {
           schedule.groups.push(line);
         }
       }

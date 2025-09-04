@@ -371,7 +371,7 @@ class WebServer {
 
       return {
         connected: this.bot.isConnected || false,
-        account: this.bot.user ? `${this.bot.user.id.split('@')[0]}` : null,
+        account: this.bot.socket?.user ? (this.bot.socket.user.name || this.bot.socket.user.id.split(':')[0]) : null,
         uptime: Math.floor((Date.now() - this.startTime) / 1000),
         activeGroups: totalGroups ? totalGroups.count : 0,
         totalMessages: totalMessages ? totalMessages.count : 0,
@@ -422,7 +422,7 @@ class WebServer {
       await this.configService.initializeWebConfig();
 
       return new Promise((resolve, reject) => {
-        this.server = this.app.listen(this.port, (err) => {
+        this.server = this.app.listen(this.port, '0.0.0.0', (err) => {
           if (err) {
             logger.error('Failed to start web server:', err);
             reject(err);
