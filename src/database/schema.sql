@@ -261,3 +261,165 @@ SELECT
 FROM bot_stats bs
 LEFT JOIN conversation_stats cs ON bs.stat_date = cs.stat_date
 ORDER BY bs.stat_date DESC;
+
+-- =====================================================
+-- Web Dashboard Extensions
+-- =====================================================
+
+-- Web Configuration Table - הגדרות ממשק הווב
+CREATE TABLE IF NOT EXISTS web_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,                     -- 'management_groups', 'api_keys', 'settings'
+    key TEXT NOT NULL,                          -- group name או config key
+    value TEXT,                                 -- group ID או config value  
+    metadata TEXT,                              -- JSON for additional data
+    active BOOLEAN DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(category, key)
+);
+
+-- Web Tasks Table - משימות ותזמונים מהממשק
+CREATE TABLE IF NOT EXISTS web_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    task_type TEXT CHECK(task_type IN ('scheduled', 'one_time')),
+    cron_expression TEXT,                       -- For scheduled tasks
+    execute_at DATETIME,                        -- For one-time tasks
+    action_type TEXT,                           -- 'daily_summary', 'today_summary', etc.
+    target_groups TEXT,                         -- JSON array של שמות קבוצות
+    message_template TEXT,
+    send_to_group TEXT,                         -- Management group לשליחת תוצאות
+    active BOOLEAN DEFAULT 1,
+    file_path TEXT,                             -- Path לקובץ txt המקושר
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Task Execution History - היסטוריית ביצוע משימות
+CREATE TABLE IF NOT EXISTS task_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER REFERENCES web_tasks(id),
+    execution_type TEXT DEFAULT 'scheduled',    -- 'scheduled', 'manual', 'web_trigger'
+    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status TEXT CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    result_message TEXT,
+    error_message TEXT,
+    duration_ms INTEGER,                        -- Duration in milliseconds
+    triggered_by TEXT                           -- User or system that triggered
+);
+
+-- Web Sessions - ניהול sessions (אופציונלי)
+CREATE TABLE IF NOT EXISTS web_sessions (
+    id TEXT PRIMARY KEY,                        -- Session ID
+    user_identifier TEXT,                       -- IP או user identifier
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP DEFAULT (datetime('now', '+24 hours')),
+    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metadata TEXT                               -- JSON with session data
+);
+
+-- Configuration History - Audit trail לשינויי הגדרות
+CREATE TABLE IF NOT EXISTS config_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT NOT NULL,                   -- איזו טבלה השתנתה
+    record_id TEXT NOT NULL,                    -- ID של הרקורד
+    action TEXT CHECK(action IN ('insert', 'update', 'delete')),
+    old_values TEXT,                            -- JSON של ערכים ישנים
+    new_values TEXT,                            -- JSON של ערכים חדשים
+    changed_by TEXT,                            -- מי ביצע את השינוי
+    change_reason TEXT,                         -- סיבת השינוי
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes לביצועים
+CREATE INDEX IF NOT EXISTS idx_web_config_category ON web_config(category);
+CREATE INDEX IF NOT EXISTS idx_web_config_active ON web_config(active);
+CREATE INDEX IF NOT EXISTS idx_web_tasks_type ON web_tasks(task_type);
+CREATE INDEX IF NOT EXISTS idx_web_tasks_active ON web_tasks(active);
+CREATE INDEX IF NOT EXISTS idx_task_executions_task ON task_executions(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_executions_status ON task_executions(status);
+CREATE INDEX IF NOT EXISTS idx_task_executions_date ON task_executions(executed_at);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_config_history_table_record ON config_history(table_name, record_id);
+
+-- Triggers לעדכון timestamps
+CREATE TRIGGER IF NOT EXISTS update_web_config_timestamp 
+    AFTER UPDATE ON web_config
+    BEGIN
+        UPDATE web_config SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS update_web_tasks_timestamp 
+    AFTER UPDATE ON web_tasks
+    BEGIN
+        UPDATE web_tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS update_web_sessions_activity 
+    AFTER UPDATE ON web_sessions
+    BEGIN
+        UPDATE web_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
+
+-- Auto-cleanup expired sessions
+CREATE TRIGGER IF NOT EXISTS cleanup_expired_sessions
+    AFTER INSERT ON web_sessions
+    BEGIN
+        DELETE FROM web_sessions 
+        WHERE expires_at < datetime('now');
+    END;
+
+-- Configuration change audit trigger
+CREATE TRIGGER IF NOT EXISTS audit_web_config_changes
+    AFTER UPDATE ON web_config
+    BEGIN
+        INSERT INTO config_history (
+            table_name, record_id, action, 
+            old_values, new_values, changed_by, change_reason
+        ) VALUES (
+            'web_config', 
+            NEW.id,
+            'update',
+            json_object('category', OLD.category, 'key', OLD.key, 'value', OLD.value, 'active', OLD.active),
+            json_object('category', NEW.category, 'key', NEW.key, 'value', NEW.value, 'active', NEW.active),
+            'web_interface',
+            'Configuration updated via web dashboard'
+        );
+    END;
+
+-- View לניהול קבוצות ממשק הווב
+CREATE VIEW IF NOT EXISTS management_groups_view AS
+SELECT 
+    wc.id,
+    wc.key as group_name,
+    wc.value as group_id,
+    wc.active,
+    g.name as resolved_name,
+    g.is_active as group_exists,
+    COUNT(m.id) as message_count,
+    MAX(m.timestamp) as last_message_time,
+    wc.created_at,
+    wc.updated_at
+FROM web_config wc
+LEFT JOIN groups g ON wc.value = g.id
+LEFT JOIN messages m ON g.id = m.group_id
+WHERE wc.category = 'management_groups'
+GROUP BY wc.id, wc.key, wc.value, wc.active, g.name, g.is_active, wc.created_at, wc.updated_at;
+
+-- View לסטטיסטיקות משימות
+CREATE VIEW IF NOT EXISTS task_stats_view AS
+SELECT 
+    wt.id,
+    wt.name,
+    wt.task_type,
+    wt.active,
+    COUNT(te.id) as total_executions,
+    COUNT(CASE WHEN te.status = 'completed' THEN 1 END) as successful_executions,
+    COUNT(CASE WHEN te.status = 'failed' THEN 1 END) as failed_executions,
+    MAX(te.executed_at) as last_execution,
+    AVG(te.duration_ms) as avg_duration_ms,
+    wt.created_at
+FROM web_tasks wt
+LEFT JOIN task_executions te ON wt.id = te.task_id
+GROUP BY wt.id, wt.name, wt.task_type, wt.active, wt.created_at;
