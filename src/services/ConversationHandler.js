@@ -66,6 +66,14 @@ class ConversationHandler {
   }
 
   /**
+   * Set ConfigService reference for dynamic group management
+   */
+  setConfigService(configService) {
+    this.dbTools.setConfigService(configService);
+    logger.info('📊 ConfigService injected for dynamic group management');
+  }
+
+  /**
    * עיבוד שאלות טבעיות - הפונקציה המרכזית עם AI Agent
    */
   async processNaturalQuery(question, groupId = null, userType = 'user', forceGroupQuery = false, userId = null, userName = null) {

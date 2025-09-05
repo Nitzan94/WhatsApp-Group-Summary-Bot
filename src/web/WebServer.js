@@ -242,6 +242,21 @@ class WebServer {
       }
     });
 
+    apiRouter.post('/config/api-key/save', async (req, res) => {
+      try {
+        const { apiKey, model } = req.body;
+        const result = await this.configService.saveApiKey(apiKey, model);
+        
+        res.json(result);
+      } catch (error) {
+        logger.error('Failed to save API key:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to save API key'
+        });
+      }
+    });
+
     // ===== Task Management =====
     
     apiRouter.get('/tasks', async (req, res) => {

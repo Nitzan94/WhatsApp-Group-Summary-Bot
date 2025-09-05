@@ -1,13 +1,15 @@
 const fs = require('fs').promises;
 const path = require('path');
+const EventEmitter = require('events');
 const logger = require('../utils/logger');
 
 /**
  * ConfigService - ניהול הגדרות ווב וסנכרון עם קבצים
  * מתאם בין ממשק הווב למערכת המבוססת קבצים הקיימת
  */
-class ConfigService {
+class ConfigService extends EventEmitter {
   constructor(db) {
+    super();
     this.db = db;
     this.schedulesPath = path.join(__dirname, '../../schedules');
     
@@ -33,7 +35,7 @@ class ConfigService {
     try {
       const groups = await this.db.allQuery(`
         SELECT 
-          id, key as group_name, value as group_id, active,
+          id, group_name, group_id, active,
           resolved_name, group_exists, message_count, 
           last_message_time, created_at, updated_at
         FROM management_groups_view
@@ -219,25 +221,46 @@ class ConfigService {
 
   /**
    * Get API key status (masked for security)
+   * Unified method for both internal use and dashboard
    */
   async getApiKeyStatus() {
     try {
-      const config = require('../../config/bot-config');
-      const apiKey = config.openrouter.apiKey;
+      // First check environment variables (primary source)
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      const model = process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet';
       
       if (!apiKey) {
+        // Fallback to config file if env var not set
+        try {
+          const config = require('../../config/bot-config');
+          if (config.openrouter?.apiKey) {
+            return {
+              keyPresent: true,
+              keyMasked: this.maskApiKey(config.openrouter.apiKey),
+              model: config.openrouter.model || model,
+              status: 'connected', // Using 'connected' for consistency
+              lastUsed: null // TODO: Track usage
+            };
+          }
+        } catch (configError) {
+          // Config file might not exist, that's okay
+        }
+        
         return {
           keyPresent: false,
           status: 'missing'
         };
       }
 
+      // Check for last usage from ConversationHandler logs
+      const lastUsed = await this.getLastApiUsage();
+      
       return {
         keyPresent: true,
         keyMasked: this.maskApiKey(apiKey),
-        model: config.openrouter.model,
-        status: 'present', // TODO: Add actual API test
-        lastUsed: null // TODO: Track usage
+        model: model,
+        status: 'connected', // Changed from 'present' to 'connected' for consistency
+        lastUsed: lastUsed
       };
 
     } catch (error) {
@@ -254,17 +277,30 @@ class ConfigService {
    */
   async testApiKey(apiKey = null) {
     try {
-      const testKey = apiKey || require('../../config/bot-config').openrouter.apiKey;
+      let testKey = apiKey;
+      
+      // Handle special case for testing existing key
+      if (apiKey === 'EXISTING_KEY' || !apiKey) {
+        // Use environment variable first, then config file
+        testKey = process.env.OPENROUTER_API_KEY;
+        if (!testKey) {
+          try {
+            const config = require('../../config/bot-config');
+            testKey = config.openrouter?.apiKey;
+          } catch (configError) {
+            // Config file might not exist
+          }
+        }
+      }
       
       if (!testKey) {
         return {
           success: false,
-          error: 'No API key provided'
+          error: 'No API key found to test'
         };
       }
 
-      // TODO: Implement actual API test call
-      // For now, just validate format
+      // Validate format
       if (!testKey.startsWith('sk-or-v1-')) {
         return {
           success: false,
@@ -272,10 +308,51 @@ class ConfigService {
         };
       }
 
-      return {
-        success: true,
-        message: 'API key format is valid'
-      };
+      // Perform actual API test call
+      try {
+        const OpenAI = require('openai');
+        const client = new OpenAI({
+          baseURL: 'https://openrouter.ai/api/v1',
+          apiKey: testKey,
+          defaultHeaders: {
+            'HTTP-Referer': 'http://localhost:3000',
+            'X-Title': 'WhatsApp Bot API Test'
+          }
+        });
+
+        // Simple test call - get models list
+        const models = await client.models.list();
+        
+        if (models && models.data && models.data.length > 0) {
+          return {
+            success: true,
+            message: 'API key is valid and working',
+            details: `Connected successfully. ${models.data.length} models available.`
+          };
+        } else {
+          return {
+            success: false,
+            error: 'API key valid but no models accessible'
+          };
+        }
+      } catch (apiError) {
+        if (apiError.status === 401) {
+          return {
+            success: false,
+            error: 'API key is invalid or expired'
+          };
+        } else if (apiError.status === 429) {
+          return {
+            success: false,
+            error: 'Rate limit exceeded - try again later'
+          };
+        } else {
+          return {
+            success: false,
+            error: `API test failed: ${apiError.message}`
+          };
+        }
+      }
 
     } catch (error) {
       logger.error('Failed to test API key:', error);
@@ -294,6 +371,128 @@ class ConfigService {
       return '••••••••';
     }
     return apiKey.substring(0, 12) + '••••••••' + apiKey.slice(-4);
+  }
+
+  /**
+   * Get last API usage time from database or conversations
+   */
+  async getLastApiUsage() {
+    try {
+      // Try to get last conversation from database
+      const lastConversation = await this.db.getQuery(
+        `SELECT created_at FROM conversations ORDER BY created_at DESC LIMIT 1`
+      );
+      
+      if (lastConversation) {
+        return lastConversation.created_at;
+      }
+      
+      // Fallback - check if we have any recent messages that might indicate AI usage
+      const recentAIUsage = await this.db.getQuery(
+        `SELECT timestamp FROM messages 
+         WHERE sender_name LIKE '%bot%' OR sender_name LIKE '%AI%' 
+         ORDER BY timestamp DESC LIMIT 1`
+      );
+      
+      if (recentAIUsage) {
+        return new Date(recentAIUsage.timestamp * 1000).toISOString();
+      }
+      
+      return null;
+    } catch (error) {
+      logger.debug('Could not determine last API usage:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Save API key to .env file
+   */
+  async saveApiKey(apiKey, model = 'anthropic/claude-3.5-sonnet') {
+    try {
+      if (!apiKey || !apiKey.trim()) {
+        return {
+          success: false,
+          error: 'API key cannot be empty'
+        };
+      }
+
+      // Validate format
+      if (!apiKey.startsWith('sk-or-v1-')) {
+        return {
+          success: false,
+          error: 'Invalid API key format. Must start with sk-or-v1-'
+        };
+      }
+
+      const fs = require('fs').promises;
+      const path = require('path');
+      const envPath = path.join(__dirname, '../../.env');
+
+      try {
+        // Read current .env file
+        let envContent = '';
+        try {
+          envContent = await fs.readFile(envPath, 'utf8');
+        } catch (error) {
+          // File doesn't exist, create new
+          envContent = '';
+        }
+
+        const lines = envContent.split('\n');
+        let apiKeyUpdated = false;
+        let modelUpdated = false;
+
+        // Update existing lines or add new ones
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith('OPENROUTER_API_KEY=')) {
+            lines[i] = `OPENROUTER_API_KEY=${apiKey}`;
+            apiKeyUpdated = true;
+          } else if (lines[i].startsWith('OPENROUTER_MODEL=')) {
+            lines[i] = `OPENROUTER_MODEL=${model}`;
+            modelUpdated = true;
+          }
+        }
+
+        // Add new lines if not found
+        if (!apiKeyUpdated) {
+          lines.push(`OPENROUTER_API_KEY=${apiKey}`);
+        }
+        if (!modelUpdated) {
+          lines.push(`OPENROUTER_MODEL=${model}`);
+        }
+
+        // Write back to .env file
+        const newEnvContent = lines.filter(line => line.trim() !== '').join('\n') + '\n';
+        await fs.writeFile(envPath, newEnvContent, 'utf8');
+
+        // Update process.env for immediate use
+        process.env.OPENROUTER_API_KEY = apiKey;
+        process.env.OPENROUTER_MODEL = model;
+
+        logger.info('API key saved successfully to .env file');
+
+        return {
+          success: true,
+          message: 'API key saved successfully',
+          details: 'Key has been saved to .env file and is ready for use'
+        };
+
+      } catch (fileError) {
+        logger.error('Failed to update .env file:', fileError);
+        return {
+          success: false,
+          error: 'Failed to save API key to configuration file'
+        };
+      }
+
+    } catch (error) {
+      logger.error('Failed to save API key:', error);
+      return {
+        success: false,
+        error: 'Failed to save API key'
+      };
+    }
   }
 
   // ===== Task Management =====
@@ -527,10 +726,8 @@ class ConfigService {
         throw new Error(`Task ${taskId} not found`);
       }
 
-      // Only sync scheduled tasks to files (one-time tasks are web-only)
-      if (task.task_type !== 'scheduled') {
-        return;
-      }
+      // Sync both scheduled and one-time tasks to files for backup/transparency
+      // (Previously only scheduled tasks were synced)
 
       const fileContent = this.convertTaskToFileFormat(task);
       const fileName = `web-task-${taskId}.txt`;
@@ -561,22 +758,35 @@ class ConfigService {
     const targetGroups = task.target_groups ? 
       JSON.parse(task.target_groups).join('\n') : '';
     
-    const schedule = this.cronToHumanReadable(task.cron_expression);
+    // Handle different task types for schedule/execution time
+    let scheduleInfo;
+    if (task.task_type === 'one_time' && task.execute_at) {
+      const executeDate = new Date(task.execute_at);
+      scheduleInfo = `execute at: ${executeDate.toLocaleString('he-IL')}`;
+    } else if (task.cron_expression) {
+      const schedule = this.cronToHumanReadable(task.cron_expression);
+      scheduleInfo = `schedule: ${schedule}`;
+    } else {
+      scheduleInfo = 'schedule: לא הוגדר';
+    }
 
     return `# ${task.name}
 # Created by web interface at ${new Date(task.created_at).toLocaleString('he-IL')}
+# Task type: ${task.task_type}
 
 groups:
 ${targetGroups}
 
 action: ${task.action_type}
-schedule: ${schedule}
+${scheduleInfo}
 send to: ${task.send_to_group || 'ניצן'}
 
 ---
 
 `;
   }
+
+  // Removed duplicate getApiKeyStatus - using the unified async version above
 
   /**
    * Convert cron expression to human readable Hebrew

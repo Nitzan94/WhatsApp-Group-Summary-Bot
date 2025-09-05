@@ -21,6 +21,8 @@ const config = require('../config/bot-config');
 const DatabaseManager = require('./database/DatabaseManager');
 const SchedulerService = require('./services/SchedulerService');
 const ConversationHandler = require('./services/ConversationHandler');
+const ConfigService = require('./services/ConfigService');
+const WebServer = require('./web/WebServer');
 
 class WhatsAppBot {
   constructor() {
@@ -39,6 +41,18 @@ class WhatsAppBot {
     this.schedulerService = new SchedulerService(this, this.db, this.conversationHandler);
     this.summaryTargetGroupId = '972546262108-1556219067@g.us'; // קבוצת "ניצן"
     this.isHistorySyncComplete = false; // Track if initial history sync is done
+    
+    // Web Dashboard Components
+    this.configService = new ConfigService(this.db);
+    
+    // Inject ConfigService into ConversationHandler for dynamic group management
+    this.conversationHandler.setConfigService(this.configService);
+    
+    // Initialize SyncManager for two-way sync between web dashboard and files
+    const SyncManager = require('./services/SyncManager');
+    this.syncManager = new SyncManager(this.configService, this.schedulerService, this.db);
+    
+    this.webServer = new WebServer(this, this.db, this.configService);
     
     // Ensure session directory exists
     if (!fs.existsSync(this.sessionPath)) {
@@ -74,6 +88,15 @@ class WhatsAppBot {
       // Set bot instance for message sending functionality
       this.conversationHandler.setBotInstance(this);
       logger.info('🤖 מערכת שיחה טבעית אותחלה');
+      
+      // Initialize web dashboard
+      try {
+        const webInfo = await this.webServer.start();
+        logger.info(`🌐 דשבורד ווב הופעל: ${webInfo.url}`);
+      } catch (webError) {
+        logger.error('⚠️ שגיאה בהפעלת דשבורד הווב:', webError);
+        logger.warn('הבוט ימשיך לפעול ללא ממשק ווב');
+      }
       
       // Get latest Baileys version
       const { version } = await fetchLatestBaileysVersion();
@@ -2403,6 +2426,14 @@ ${analysisResult.analysis}
       }
       
       logger.info('✨ הבוט מוכן לפעולה!');
+      
+      // Initialize SyncManager for two-way sync between web dashboard and files
+      try {
+        await this.syncManager.initialize();
+        logger.info('🔄 SyncManager הופעל בהצלחה');
+      } catch (error) {
+        logger.error('Failed to initialize SyncManager:', error);
+      }
     } catch (error) {
       logger.error('Failed to get groups:', error);
     }
@@ -2413,6 +2444,16 @@ ${analysisResult.analysis}
    */
   async shutdown() {
     logger.info('🔄 מתחיל כיבוי מבוקר...');
+    
+    // Stop SyncManager
+    if (this.syncManager) {
+      try {
+        await this.syncManager.stop();
+        logger.info('✅ SyncManager נסגר בהצלחה');
+      } catch (error) {
+        logger.error('Error stopping SyncManager:', error);
+      }
+    }
     
     // Close database connection
     if (this.db) {
@@ -3265,6 +3306,136 @@ ${analysisResult.analysis}
       await this.socket.sendMessage(groupId, {
         text: '❌ שגיאה בקבלת רשימת הקבוצות'
       });
+    }
+  }
+
+  // ===== Dynamic Management Groups Support =====
+  
+  /**
+   * Get active management groups from web config (replaces hardcoded summaryTargetGroupId)
+   */
+  async getManagementGroups() {
+    try {
+      return await this.configService.getManagementGroups();
+    } catch (error) {
+      logger.error('Failed to get management groups:', error);
+      // Fallback to hardcoded group for backwards compatibility
+      return [{
+        id: 1,
+        group_name: 'ניצן',
+        group_id: this.summaryTargetGroupId,
+        active: true
+      }];
+    }
+  }
+
+  /**
+   * Check if group is a management group (replaces isFromNitzanGroup checks)
+   */
+  async isManagementGroup(groupId) {
+    try {
+      const managementGroups = await this.getManagementGroups();
+      return managementGroups.some(g => g.group_id === groupId && g.active);
+    } catch (error) {
+      logger.error('Failed to check management group:', error);
+      // Fallback to hardcoded check
+      return groupId === this.summaryTargetGroupId;
+    }
+  }
+
+  /**
+   * Get primary management group for sending summary results
+   */
+  async getPrimaryManagementGroup() {
+    try {
+      const groups = await this.getManagementGroups();
+      const activeGroups = groups.filter(g => g.active);
+      
+      if (activeGroups.length > 0) {
+        // Return the first active group
+        return activeGroups[0].group_id;
+      } else {
+        // Fallback to hardcoded group
+        return this.summaryTargetGroupId;
+      }
+    } catch (error) {
+      logger.error('Failed to get primary management group:', error);
+      return this.summaryTargetGroupId;
+    }
+  }
+
+  /**
+   * Send message to all active management groups
+   */
+  async sendToManagementGroups(message, options = {}) {
+    try {
+      const groups = await this.getManagementGroups();
+      const activeGroups = groups.filter(g => g.active);
+      
+      if (activeGroups.length === 0) {
+        // Fallback to hardcoded group
+        if (this.socket && this.summaryTargetGroupId) {
+          await this.socket.sendMessage(this.summaryTargetGroupId, message);
+        }
+        return;
+      }
+
+      // Send to all active management groups
+      const promises = activeGroups.map(group => {
+        if (this.socket && group.group_id) {
+          return this.socket.sendMessage(group.group_id, message);
+        }
+      });
+
+      await Promise.all(promises.filter(p => p));
+      
+      if (options.logSuccess) {
+        logger.info(`Message sent to ${activeGroups.length} management groups`);
+      }
+    } catch (error) {
+      logger.error('Failed to send message to management groups:', error);
+      
+      // Fallback to hardcoded group
+      if (this.socket && this.summaryTargetGroupId) {
+        try {
+          await this.socket.sendMessage(this.summaryTargetGroupId, message);
+        } catch (fallbackError) {
+          logger.error('Fallback message sending also failed:', fallbackError);
+        }
+      }
+    }
+  }
+
+  /**
+   * Gracefully stop the bot and web server
+   */
+  async shutdown() {
+    try {
+      logger.info('🛑 Shutting down WhatsApp Bot...');
+      
+      // Stop web server
+      if (this.webServer) {
+        await this.webServer.stop();
+      }
+      
+      // Stop scheduler
+      if (this.schedulerService) {
+        await this.schedulerService.stop();
+      }
+      
+      // Close database connection
+      if (this.db) {
+        await this.db.close();
+      }
+      
+      // Close WhatsApp socket
+      if (this.socket) {
+        this.socket.end();
+      }
+      
+      logger.info('✅ Bot shutdown complete');
+    } catch (error) {
+      logger.error('Error during shutdown:', error);
     }
   }
 }

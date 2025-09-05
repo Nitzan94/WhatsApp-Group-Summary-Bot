@@ -3,6 +3,7 @@ class ConfigComponent {
     this.apiKeyInput = document.getElementById('api-key-input');
     this.toggleBtn = document.getElementById('toggle-api-key');
     this.testBtn = document.getElementById('test-api-btn');
+    this.saveBtn = document.getElementById('save-api-btn');
     this.currentModel = document.getElementById('current-model');
     this.lastUsage = document.getElementById('last-api-usage');
     this.isPasswordVisible = false;
@@ -16,6 +17,7 @@ class ConfigComponent {
   setupEventListeners() {
     this.toggleBtn.addEventListener('click', () => this.togglePasswordVisibility());
     this.testBtn.addEventListener('click', () => this.testApiKey());
+    this.saveBtn.addEventListener('click', () => this.saveApiKey());
   }
 
   async loadApiStatus() {
@@ -70,11 +72,23 @@ class ConfigComponent {
   }
 
   async testApiKey() {
-    const apiKey = this.apiKeyInput.value.trim();
+    let apiKey = this.apiKeyInput.value.trim();
     
+    // If no key entered, use the existing key from server
     if (!apiKey) {
-      this.showToast('נא להזין מפתח API', 'error');
-      return;
+      try {
+        const statusResponse = await window.API.getApiKeyStatus();
+        if (statusResponse.data && statusResponse.data.keyPresent) {
+          // Use existing API key for testing
+          apiKey = 'EXISTING_KEY'; // Signal to use existing key
+        } else {
+          this.showToast('נא להזין מפתח API', 'error');
+          return;
+        }
+      } catch (error) {
+        this.showToast('נא להזין מפתח API', 'error');
+        return;
+      }
     }
 
     // Show loading state
@@ -85,7 +99,7 @@ class ConfigComponent {
       const response = await window.API.testApiKey(apiKey);
       
       if (response.success) {
-        this.showToast('החיבור תקין!', 'success');
+        this.showToast(`החיבור תקין! ${response.details || ''}`, 'success');
         this.apiKeyInput.classList.remove('border-red-500');
         this.apiKeyInput.classList.add('border-green-500');
       } else {
@@ -102,6 +116,45 @@ class ConfigComponent {
         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
                 d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+      `;
+    }
+  }
+
+  async saveApiKey() {
+    const apiKey = this.apiKeyInput.value.trim();
+    const model = this.currentModel.textContent.trim() || 'anthropic/claude-3.5-sonnet';
+    
+    if (!apiKey) {
+      this.showToast('נא להזין מפתח API לפני השמירה', 'error');
+      return;
+    }
+
+    // Show loading state
+    this.saveBtn.disabled = true;
+    this.saveBtn.innerHTML = '<span>שומר...</span>';
+    
+    try {
+      const response = await window.API.saveApiKey(apiKey, model);
+      
+      if (response.success) {
+        this.showToast('המפתח נשמר בהצלחה!', 'success');
+        // Clear the input field for security
+        this.apiKeyInput.value = '';
+        // Reload API status to show updated info
+        await this.loadApiStatus();
+      } else {
+        this.showToast(response.error || 'שגיאה בשמירת המפתח', 'error');
+      }
+    } catch (error) {
+      this.showToast('שגיאה בשמירת המפתח', 'error');
+    } finally {
+      this.saveBtn.disabled = false;
+      this.saveBtn.innerHTML = `
+        <span>שמור מפתח</span>
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3-3m0 0l-3 3m3-3v12"></path>
         </svg>
       `;
     }

@@ -6,8 +6,16 @@ const { logDatabaseSearch } = require('../utils/agentLogger');
  * מאפשר ל-AI לחפש ולקרוא הודעות בעצמו
  */
 class DatabaseAgentTools {
-  constructor(databaseManager) {
+  constructor(databaseManager, configService = null) {
     this.db = databaseManager;
+    this.configService = configService;
+  }
+
+  /**
+   * Set ConfigService reference for dynamic authorization
+   */
+  setConfigService(configService) {
+    this.configService = configService;
   }
 
   /**
@@ -559,12 +567,12 @@ class DatabaseAgentTools {
     try {
       logger.info(`📤 [DB TOOLS] Attempting to send message to group: "${groupName}"`);
       
-      // Permission check - only works from Nitzan bot group
-      if (!this.isAuthorizedForSending()) {
-        logger.warn(`🚫 [DB TOOLS] Unauthorized attempt to send message from non-Nitzan group`);
+      // Permission check - only works from authorized management groups
+      if (!(await this.isAuthorizedForSending())) {
+        logger.warn(`🚫 [DB TOOLS] Unauthorized attempt to send message from non-authorized group`);
         return {
           success: false,
-          error: 'שליחת הודעות לקבוצות אחרות מותרת רק מקבוצת ניצן'
+          error: 'שליחת הודעות לקבוצות אחרות מותרת רק מקבוצות ניהול מורשות'
         };
       }
 
@@ -702,12 +710,12 @@ class DatabaseAgentTools {
     try {
       logger.info(`📤 [DB TOOLS] Attempting to send message to contact: "${contactName}"`);
       
-      // Permission check - only works from authorized groups
-      if (!this.isAuthorizedForSending()) {
+      // Permission check - only works from authorized management groups
+      if (!(await this.isAuthorizedForSending())) {
         logger.warn(`🚫 [DB TOOLS] Unauthorized attempt to send message from non-authorized group`);
         return {
           success: false,
-          error: 'שליחת הודעות לאנשי קשר מותרת רק מקבוצות מורשות'
+          error: 'שליחת הודעות לאנשי קשר מותרת רק מקבוצות ניהול מורשות'
         };
       }
 
@@ -774,14 +782,35 @@ class DatabaseAgentTools {
 
   /**
    * Check if current request is authorized for sending messages
+   * Now uses dynamic management groups from database instead of hardcoded list
    */
-  isAuthorizedForSending() {
-    // This will be set by ConversationHandler based on the requesting group
-    const authorizedGroups = [
-      '120363417758222119@g.us', // Nitzan bot group
-      '972546262108-1556219067@g.us' // ניצן group
-    ];
-    return authorizedGroups.includes(this.currentContext?.groupId);
+  async isAuthorizedForSending() {
+    try {
+      // Get management groups from database via ConfigService
+      if (!this.configService) {
+        // Fallback to hardcoded groups if ConfigService not available
+        const fallbackGroups = [
+          '120363417758222119@g.us', // Nitzan bot group
+          '972546262108-1556219067@g.us' // ניצן group
+        ];
+        return fallbackGroups.includes(this.currentContext?.groupId);
+      }
+
+      const managementGroups = await this.configService.getManagementGroups();
+      const authorizedGroupIds = managementGroups
+        .filter(g => g.active)
+        .map(g => g.group_id);
+      
+      return authorizedGroupIds.includes(this.currentContext?.groupId);
+    } catch (error) {
+      logger.error('Failed to check authorization, using fallback:', error);
+      // Fallback to hardcoded groups on error
+      const fallbackGroups = [
+        '120363417758222119@g.us', // Nitzan bot group
+        '972546262108-1556219067@g.us' // ניצן group
+      ];
+      return fallbackGroups.includes(this.currentContext?.groupId);
+    }
   }
 
   /**

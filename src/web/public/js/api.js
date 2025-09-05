@@ -31,10 +31,28 @@ class API {
   // Real-time status stream (Server-Sent Events)
   streamStatus(callback) {
     const eventSource = new EventSource(`${this.baseURL}/status/stream`);
+    
     eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      callback(data);
+      try {
+        const data = JSON.parse(event.data);
+        callback(data);
+      } catch (error) {
+        console.error('Failed to parse SSE data:', error);
+      }
     };
+    
+    eventSource.onerror = (error) => {
+      console.error('SSE connection error:', error);
+      // Try to reconnect after a delay if connection is closed
+      if (eventSource.readyState === EventSource.CLOSED) {
+        console.log('SSE connection closed, will attempt to reconnect...');
+      }
+    };
+    
+    eventSource.onopen = () => {
+      console.log('SSE connection established');
+    };
+    
     return eventSource;
   }
 
@@ -65,6 +83,13 @@ class API {
     return this.request('/config/api-key/test', {
       method: 'POST',
       body: JSON.stringify({ apiKey })
+    });
+  }
+  
+  async saveApiKey(apiKey, model) {
+    return this.request('/config/api-key/save', {
+      method: 'POST',
+      body: JSON.stringify({ apiKey, model })
     });
   }
 
