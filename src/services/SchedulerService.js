@@ -4,6 +4,20 @@ const path = require('path');
 const chokidar = require('chokidar');
 const logger = require('../utils/logger');
 const ScheduleParser = require('./ScheduleParser');
+// מערכת לוגים מפורטת לתזמונים
+const {
+  logScheduledTaskStart,
+  logScheduledTaskStep,
+  logScheduledDataOperation,
+  logScheduledToolUsage,
+  logScheduledAIInteraction,
+  logScheduledOutput,
+  logScheduledTaskEnd,
+  logScheduledTaskError,
+  logScheduledInsights,
+  logSchedulerManagement,
+  generateSchedulerSessionId
+} = require('../utils/schedulerLogger');
 
 class SchedulerService {
   constructor(bot, db, conversationHandler = null) {
@@ -269,50 +283,120 @@ class SchedulerService {
    * Execute a scheduled task using AI Agent
    */
   async executeSchedule(schedule) {
+    const sessionId = generateSchedulerSessionId(schedule.id || schedule.name);
+    const startTime = Date.now();
+    
     try {
       logger.info(`⏰ מבצע תזמון: ${schedule.name}`);
       
+      // Log scheduled task start
+      logScheduledTaskStart(sessionId, {
+        id: schedule.id || schedule.name,
+        name: schedule.name,
+        task_type: 'scheduled',
+        description: schedule.description || schedule.action,
+        schedule_expression: schedule.schedule,
+        next_run: new Date().toISOString(),
+        target_groups: schedule.groups || []
+      });
+      
       if (!this.conversationHandler) {
         logger.error('ConversationHandler לא זמין לביצוע תזמון');
+        logScheduledTaskError(sessionId, schedule.id, new Error('ConversationHandler not available'), {
+          schedule: schedule.name
+        });
         return;
       }
       
+      logScheduledTaskStep(sessionId, schedule.id, 'processing_groups', {
+        groupCount: schedule.groups?.length || 0,
+        groups: schedule.groups || []
+      });
+      
       // Process each group in the schedule
       for (const groupName of schedule.groups) {
-        await this.executeScheduleForGroup(schedule, groupName);
+        await this.executeScheduleForGroup(schedule, groupName, sessionId);
       }
       
+      const duration = Date.now() - startTime;
       logger.info(`✅ תזמון הושלם: ${schedule.name}`);
       
+      // Log successful completion
+      logScheduledTaskEnd(sessionId, schedule.id, duration, true, {
+        toolsUsed: schedule.groups?.length || 0,
+        dataOperationsExecuted: schedule.groups?.length || 0,
+        groupsProcessed: schedule.groups || [],
+        outputsSent: schedule.groups?.length || 0
+      }, this.getNextRunTime(schedule));
+      
     } catch (error) {
+      const duration = Date.now() - startTime;
       logger.error(`Failed to execute schedule ${schedule.name}:`, error);
+      
+      logScheduledTaskError(sessionId, schedule.id, error, {
+        schedule: schedule.name,
+        duration
+      });
+      
+      logScheduledTaskEnd(sessionId, schedule.id, duration, false, {
+        toolsUsed: 0,
+        dataOperationsExecuted: 0,
+        groupsProcessed: [],
+        outputsSent: 0
+      });
     }
   }
 
   /**
    * Execute schedule for a specific group using AI Agent
    */
-  async executeScheduleForGroup(schedule, groupName) {
+  async executeScheduleForGroup(schedule, groupName, sessionId) {
+    const taskId = schedule.id || schedule.name;
+    const stepStartTime = Date.now();
+    
     try {
       logger.info(`🤖 מבצע ${schedule.action} עבור קבוצת "${groupName}"`);
+      
+      logScheduledTaskStep(sessionId, taskId, 'processing_single_group', {
+        groupName,
+        action: schedule.action
+      });
       
       // Create a natural language query based on the schedule action
       const query = this.buildNaturalQuery(schedule.action, groupName);
       
       logger.debug(`🗣️ שאילתה טבעית: "${query}"`);
       
+      logScheduledTaskStep(sessionId, taskId, 'natural_query_built', {
+        query: query.substring(0, 200) + '...',
+        queryLength: query.length
+      });
+      
       // Use ConversationHandler to process the query
+      const aiStartTime = Date.now();
       const result = await this.conversationHandler.processNaturalQuery(
         query,
         null, // no specific groupId - let AI Agent resolve the group name
         'system', // system user
         true // forceGroupQuery to ensure proper context
       );
+      const aiDuration = Date.now() - aiStartTime;
+      
+      logScheduledAIInteraction(sessionId, taskId, query, result?.response || '', [], aiDuration);
       
       if (!result || !result.success) {
         logger.error(`AI Agent failed for ${groupName}: ${result?.error || 'Unknown error'}`);
+        logScheduledTaskError(sessionId, taskId, new Error(result?.error || 'AI Agent failed'), {
+          groupName,
+          query
+        });
         return;
       }
+      
+      logScheduledTaskStep(sessionId, taskId, 'formatting_result', {
+        responseLength: result.response?.length || 0,
+        scheduleName: schedule.name
+      });
       
       // Format the result for scheduled delivery
       const scheduledMessage = this.formatScheduledResult(
@@ -321,13 +405,54 @@ class SchedulerService {
         groupName
       );
       
-      // Send to target group/chat
-      await this.sendScheduledMessage(scheduledMessage, schedule.sendTo);
+      logScheduledTaskStep(sessionId, taskId, 'sending_message', {
+        messageLength: scheduledMessage?.length || 0,
+        sendTo: schedule.sendTo
+      });
       
-      logger.info(`✅ תזמון הושלם עבור קבוצת "${groupName}"`);
+      // Send to target group/chat
+      const sendStartTime = Date.now();
+      await this.sendScheduledMessage(scheduledMessage, schedule.sendTo);
+      const sendDuration = Date.now() - sendStartTime;
+      
+      logScheduledOutput(sessionId, taskId, [schedule.sendTo], {
+        attempted: 1,
+        successful: 1,
+        failed: 0
+      }, true, []);
+      
+      const totalDuration = Date.now() - stepStartTime;
+      logger.info(`✅ תזמון הושלם עבור קבוצת "${groupName}" תוך ${totalDuration}ms`);
       
     } catch (error) {
+      const totalDuration = Date.now() - stepStartTime;
       logger.error(`Failed to execute schedule for group ${groupName}:`, error);
+      
+      logScheduledTaskError(sessionId, taskId, error, {
+        groupName,
+        duration: totalDuration,
+        step: 'execution'
+      });
+      
+      logScheduledOutput(sessionId, taskId, [schedule.sendTo], {
+        attempted: 1,
+        successful: 0,
+        failed: 1
+      }, false, [{ groupId: schedule.sendTo, error }]);
+    }
+  }
+
+  /**
+   * Get next scheduled run time for a schedule
+   */
+  getNextRunTime(schedule) {
+    try {
+      if (schedule.cronExpression) {
+        return cron.schedule(schedule.cronExpression, () => {}).nextRun?.toISOString();
+      }
+      return null;
+    } catch (error) {
+      return null;
     }
   }
 

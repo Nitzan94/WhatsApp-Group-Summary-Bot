@@ -6,11 +6,27 @@ class TasksComponent {
     this.oneTimeContainer = document.getElementById('one-time-tasks-list');
     this.addScheduledBtn = document.getElementById('add-scheduled-task-btn');
     this.addOneTimeBtn = document.getElementById('add-onetime-task-btn');
+    this.refreshInterval = null;
   }
 
   async initialize() {
     await this.loadTasks();
     this.setupEventListeners();
+    this.startAutoRefresh();
+  }
+  
+  startAutoRefresh() {
+    // Refresh tasks every 30 seconds
+    this.refreshInterval = setInterval(() => {
+      this.loadTasks(true); // Silent refresh
+    }, 30000);
+  }
+  
+  stopAutoRefresh() {
+    if (this.refreshInterval) {
+      clearInterval(this.refreshInterval);
+      this.refreshInterval = null;
+    }
   }
 
   setupEventListeners() {
@@ -18,15 +34,22 @@ class TasksComponent {
     this.addOneTimeBtn.addEventListener('click', () => this.showAddTaskModal('one_time'));
   }
 
-  async loadTasks() {
+  async loadTasks(silent = false) {
     try {
       const response = await window.API.getTasks();
       this.scheduledTasks = response.data.scheduled || [];
       this.oneTimeTasks = response.data.oneTime || [];
       this.render();
+      
+      if (!silent) {
+        // Show success feedback only for manual refresh
+        console.log('Tasks loaded successfully');
+      }
     } catch (error) {
       console.error('Failed to load tasks:', error);
-      this.showError();
+      if (!silent) {
+        this.showError();
+      }
     }
   }
 
@@ -64,6 +87,11 @@ class TasksComponent {
                 הרצה הבאה: ${new Date(task.next_run).toLocaleString('he-IL')}
               </div>
             ` : ''}
+            ${task.last_execution ? `
+              <div class="text-xs text-gray-500">
+                הרצה אחרונה: ${new Date(task.last_execution).toLocaleString('he-IL')}
+              </div>
+            ` : ''}
           </div>
           <div class="flex items-center space-x-2 space-x-reverse">
             <button onclick="window.tasksComponent.toggleTask(${task.id}, ${!task.active})" 
@@ -71,7 +99,7 @@ class TasksComponent {
               ${task.active ? '⏸️' : '▶️'}
             </button>
             <button onclick="window.tasksComponent.executeTask(${task.id})" 
-                    class="p-2 text-blue-600 hover:text-blue-800">
+                    class="p-2 text-blue-600 hover:text-blue-800" title="בצע עכשיו">
               🚀
             </button>
             <button onclick="window.tasksComponent.deleteTask(${task.id})" 
@@ -288,29 +316,42 @@ class TasksComponent {
       return;
     }
 
+    // Show loading state
+    this.showToast('מבצע משימה...', 'info');
+    
     try {
       const response = await window.API.executeTask(id);
       if (response.success) {
         this.showToast('המשימה נשלחה לביצוע', 'success');
+        // Refresh tasks after 2 seconds to show updated status
+        setTimeout(() => {
+          this.loadTasks();
+        }, 2000);
+      } else {
+        this.showToast(response.message || 'המשימה לא בוצעה', 'error');
       }
     } catch (error) {
-      this.showToast('שגיאה בביצוע המשימה', 'error');
+      console.error('Task execution error:', error);
+      this.showToast(`שגיאה בביצוע המשימה: ${error.message || 'שגיאה לא ידועה'}`, 'error');
     }
   }
 
   async deleteTask(id) {
-    if (!confirm('למחוק את המשימה?')) {
+    if (!confirm('למחוק את המשימה? פעולה זו אינה ניתנת לביטול.')) {
       return;
     }
 
     try {
       const response = await window.API.deleteTask(id);
       if (response.success) {
-        this.showToast('המשימה נמחקה', 'success');
+        this.showToast('המשימה נמחקה בהצלחה', 'success');
         await this.loadTasks();
+      } else {
+        this.showToast(response.message || 'המשימה לא נמחקה', 'error');
       }
     } catch (error) {
-      this.showToast('שגיאה במחיקת המשימה', 'error');
+      console.error('Task deletion error:', error);
+      this.showToast(`שגיאה במחיקת המשימה: ${error.message || 'שגיאה לא ידועה'}`, 'error');
     }
   }
 
@@ -371,6 +412,10 @@ class TasksComponent {
       "'": '&#39;'
     };
     return text.replace(/[&<>"']/g, m => map[m]);
+  }
+  
+  destroy() {
+    this.stopAutoRefresh();
   }
 }
 

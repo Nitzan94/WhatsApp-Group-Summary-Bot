@@ -11,6 +11,18 @@ const {
   logDataInsights,
   generateSessionId
 } = require('../utils/agentLogger');
+// מערכת לוגים מפורטת חדשה לבקשות משתמש
+const {
+  logRequestStart,
+  logProcessingStep,
+  logDataRead,
+  logToolUsage,
+  logAIInteraction,
+  logResponse,
+  logRequestEnd,
+  logInsights,
+  generateSessionId: generateRequestSessionId
+} = require('../utils/requestLogger');
 
 /**
  * ConversationHandler - הליבה החדשה לשיחה טבעית
@@ -78,6 +90,7 @@ class ConversationHandler {
    */
   async processNaturalQuery(question, groupId = null, userType = 'user', forceGroupQuery = false, userId = null, userName = null) {
     const sessionId = generateSessionId();
+    const requestSessionId = generateRequestSessionId();
     const startTime = Date.now();
     let success = false;
     let error = null;
@@ -91,27 +104,71 @@ class ConversationHandler {
         try {
           const groupInfo = await this.db.getQuery('SELECT name FROM groups WHERE id = ?', [groupId]);
           groupName = groupInfo?.name || 'Unknown Group';
+          logDataRead(requestSessionId, 'group_info_lookup', 'SELECT name FROM groups WHERE id = ?', groupInfo);
         } catch (err) {
           groupName = 'Unknown Group';
         }
       }
       
-      // Log conversation start
+      // Log conversation start (existing system)
       logConversationStart(sessionId, question, userId || 'Unknown User', groupId, groupName);
       
+      // Log request start (new detailed system)
+      logRequestStart(requestSessionId, {
+        userId,
+        userName,
+        groupId,
+        groupName,
+        messageId: null,
+        question
+      });
+      
+      logProcessingStep(requestSessionId, 'initialization', {
+        userType,
+        forceGroupQuery,
+        sessionId: sessionId
+      });
+      
       // Build context from parameters
-      const context = { groupId, userType, forceGroupQuery, sessionId };
+      const context = { groupId, userType, forceGroupQuery, sessionId, requestSessionId };
+      
+      logProcessingStep(requestSessionId, 'context_setup', {
+        context: Object.keys(context)
+      });
       
       // Set context for DatabaseAgentTools (for permission checking)
       this.dbTools.setContext(context);
       
+      logProcessingStep(requestSessionId, 'sending_to_ai_agent', {
+        model: this.model,
+        maxTokens: this.maxTokens
+      });
+      
       // שליחה ל-AI כ-Agent עם כלי מסד נתונים
       const response = await this.queryAIAgent(question, context);
+      
+      logProcessingStep(requestSessionId, 'ai_response_received', {
+        responseLength: response?.length || 0,
+        responsePreview: response ? response.substring(0, 100) + '...' : null
+      });
       
       const duration = Date.now() - startTime;
       logger.info(`✅ [AI AGENT] שאלה עובדה תוך ${duration}ms`);
       
       success = true;
+      
+      // Log response sent (new system)
+      logResponse(requestSessionId, response, true, null);
+      
+      // Log request end (new system)
+      logRequestEnd(requestSessionId, duration, true, {
+        toolsUsed: this.dbTools.getToolUsageCount?.() || 0,
+        dataQueriesExecuted: this.dbTools.getQueryCount?.() || 0,
+        messagesAnalyzed: this.dbTools.getAnalyzedMessagesCount?.() || 0,
+        groupsAccessed: [groupId].filter(Boolean),
+        aiInteractions: 1
+      });
+      
       logConversationEnd(sessionId, true, null, duration);
       
       // Return structured response only for SchedulerService (when userType is 'system')
@@ -130,8 +187,20 @@ class ConversationHandler {
     } catch (error) {
       logger.error('Error processing natural query with AI Agent:', error);
       
-      // Log conversation error  
       const duration = Date.now() - startTime;
+      const errorMessage = `❌ מצטער ${userType === 'user' ? 'Nitzan Bar-Ness' : ''}, יש לי קצת בעיה טכנית עכשיו.\nאנסה שוב מאוחר יותר או נסח את השאלה אחרת.`;
+      
+      // Log error in new system
+      logResponse(requestSessionId, errorMessage, false, error);
+      logRequestEnd(requestSessionId, duration, false, {
+        toolsUsed: this.dbTools.getToolUsageCount?.() || 0,
+        dataQueriesExecuted: this.dbTools.getQueryCount?.() || 0,
+        messagesAnalyzed: 0,
+        groupsAccessed: [groupId].filter(Boolean),
+        aiInteractions: 0
+      });
+      
+      // Log conversation error (existing system) 
       logConversationEnd(sessionId, false, error, duration);
       
       // Return structured response for system calls, plain error message for users
@@ -144,7 +213,7 @@ class ConversationHandler {
       }
       
       // For regular users, return a user-friendly error message
-      return `❌ מצטער ${userType === 'user' ? 'Nitzan Bar-Ness' : ''}, יש לי קצת בעיה טכנית עכשיו.\nאנסה שוב מאוחר יותר או נסח את השאלה אחרת.`;
+      return errorMessage;
     }
   }
 
@@ -386,11 +455,21 @@ class ConversationHandler {
    */
   async queryAIAgent(question, context = {}) {
     const startTime = Date.now();
+    const { requestSessionId } = context;
+    
     try {
       const systemPrompt = this.buildSystemPromptForAgent();
       const tools = this.dbTools.createToolDefinitions();
       
       logger.info(`🤖 [AI AGENT] Sending question with ${tools.length} database tools available`);
+      
+      if (requestSessionId) {
+        logProcessingStep(requestSessionId, 'ai_agent_preparation', {
+          toolsAvailable: tools.length,
+          systemPromptLength: systemPrompt.length,
+          model: this.model
+        });
+      }
       
       const messages = [
         { role: 'system', content: systemPrompt },
@@ -408,6 +487,15 @@ class ConversationHandler {
         })),
         tool_choice: 'auto'
       });
+      
+      if (requestSessionId) {
+        logAIInteraction(requestSessionId, 
+          systemPrompt + '\n\nUser: ' + question,
+          response.choices[0]?.message?.content || '',
+          response.choices[0]?.message?.tool_calls || [],
+          Date.now() - startTime
+        );
+      }
       
       let finalAnswer = '';
       let toolCallsCount = 0;
@@ -432,8 +520,13 @@ class ConversationHandler {
             const toolResult = await this.dbTools.executeTool(name, parsedArgs);
             const toolExecutionTime = Date.now() - toolStartTime;
             
-            // Log detailed tool execution
+            // Log detailed tool execution (existing system)
             logToolExecution(context.sessionId, name, parsedArgs, toolResult, toolExecutionTime);
+            
+            // Log tool usage (new detailed system)
+            if (requestSessionId) {
+              logToolUsage(requestSessionId, name, parsedArgs, toolResult, toolExecutionTime);
+            }
             
             // הוספת תוצאת ה-tool
             messages.push({
@@ -446,8 +539,13 @@ class ConversationHandler {
             const toolExecutionTime = Date.now() - toolStartTime;
             logger.error(`Error executing tool ${name}:`, error);
             
-            // Log failed tool execution
+            // Log failed tool execution (existing system)
             logToolExecution(context.sessionId, name, JSON.parse(args || '{}'), { error: error.message }, toolExecutionTime);
+            
+            // Log failed tool usage (new detailed system)
+            if (requestSessionId) {
+              logToolUsage(requestSessionId, name, JSON.parse(args || '{}'), { error: error.message }, toolExecutionTime);
+            }
             
             messages.push({
               role: 'tool',
