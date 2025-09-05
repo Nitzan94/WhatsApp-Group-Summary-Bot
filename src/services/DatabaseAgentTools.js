@@ -790,8 +790,7 @@ class DatabaseAgentTools {
       if (!this.configService) {
         // Fallback to hardcoded groups if ConfigService not available
         const fallbackGroups = [
-          '120363417758222119@g.us', // Nitzan bot group
-          '972546262108-1556219067@g.us' // ניצן group
+          '120363417758222119@g.us' // Nitzan bot group
         ];
         return fallbackGroups.includes(this.currentContext?.groupId);
       }
@@ -806,8 +805,7 @@ class DatabaseAgentTools {
       logger.error('Failed to check authorization, using fallback:', error);
       // Fallback to hardcoded groups on error
       const fallbackGroups = [
-        '120363417758222119@g.us', // Nitzan bot group
-        '972546262108-1556219067@g.us' // ניצן group
+        '120363417758222119@g.us' // Nitzan bot group
       ];
       return fallbackGroups.includes(this.currentContext?.groupId);
     }

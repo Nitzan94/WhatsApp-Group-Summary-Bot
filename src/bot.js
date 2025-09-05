@@ -487,7 +487,7 @@ class WhatsAppBot {
             // פקודות קיימות
             logger.info(`📝 פקודה התקבלה: ${text}`);
             await this.handleCommand(message, text);
-          } else if (this.isConversationGroup(groupId) && text && text.trim().length > 3) {
+          } else if (await this.isConversationGroup(groupId) && text && text.trim().length > 3) {
             // שיחה טבעית בקבוצת ניצן
             logger.info(`🗣️ שאלה טבעית מתקבלת: "${text.substring(0, 100)}..."`);
             await this.handleNaturalConversation(message, text, groupId, senderId, senderName);
@@ -3157,8 +3157,7 @@ ${analysisResult.analysis}
       
       // Fallback לקבוצות קבועות אם ConfigService לא זמין
       const fallbackGroups = [
-        '120363417758222119@g.us', // Nitzan bot
-        '972546262108-1556219067@g.us' // ניצן
+        '120363417758222119@g.us' // Nitzan bot
       ];
       return fallbackGroups.includes(groupId);
       
@@ -3166,8 +3165,7 @@ ${analysisResult.analysis}
       logger.error('Error checking conversation group:', error);
       // Fallback במקרה של שגיאה
       const fallbackGroups = [
-        '120363417758222119@g.us', // Nitzan bot
-        '972546262108-1556219067@g.us' // ניצן
+        '120363417758222119@g.us' // Nitzan bot
       ];
       return fallbackGroups.includes(groupId);
     }
