@@ -196,9 +196,11 @@ class WhatsAppBot {
     }
 
     // Handle connection states
+    logger.debug(`🔍 Connection state: ${connection}`); // Debug log
     if (connection === 'close') {
       this.handleDisconnection(lastDisconnect);
     } else if (connection === 'open') {
+      logger.info('🔗 Connection is open, calling handleSuccessfulConnection');
       this.handleSuccessfulConnection();
     } else if (connection === 'connecting') {
       logger.info('🔄 מתחבר לWhatsApp...');
@@ -3142,14 +3144,33 @@ ${analysisResult.analysis}
   /**
    * בדיקה אם הקבוצה מוגדרת לשיחה טבעית
    */
-  isConversationGroup(groupId) {
-    // קבוצת "Nitzan bot" מוגדרת לשיחה טבעית
-    const conversationGroupId = '120363417758222119@g.us'; // Nitzan bot
-    return groupId === conversationGroupId;
-    
-    // בעתיד אפשר להרחיב לקבוצות נוספות:
-    // const conversationGroups = process.env.CONVERSATION_GROUPS?.split(',') || [conversationGroupId];
-    // return conversationGroups.includes(groupId);
+  async isConversationGroup(groupId) {
+    try {
+      // קבוצות שיחה = כל הקבוצות הפעילות מהדשבורד
+      if (this.configService) {
+        const managementGroups = await this.configService.getManagementGroups();
+        const conversationGroupIds = managementGroups
+          .filter(g => g.active)
+          .map(g => g.group_id);
+        return conversationGroupIds.includes(groupId);
+      }
+      
+      // Fallback לקבוצות קבועות אם ConfigService לא זמין
+      const fallbackGroups = [
+        '120363417758222119@g.us', // Nitzan bot
+        '972546262108-1556219067@g.us' // ניצן
+      ];
+      return fallbackGroups.includes(groupId);
+      
+    } catch (error) {
+      logger.error('Error checking conversation group:', error);
+      // Fallback במקרה של שגיאה
+      const fallbackGroups = [
+        '120363417758222119@g.us', // Nitzan bot
+        '972546262108-1556219067@g.us' // ניצן
+      ];
+      return fallbackGroups.includes(groupId);
+    }
   }
 
   /**
