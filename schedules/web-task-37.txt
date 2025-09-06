@@ -1,0 +1,13 @@
+# סיכום
+# Created by web interface at 6.9.2025, 10:54:14
+# Task type: scheduled
+
+groups:
+קורס דיגיטלי | שימוש פרקטי בכלי AI עם גיא אגא יוני 2025
+
+action: daily_summary
+schedule: 10 22 * * *
+send to: ניצן
+
+---
+

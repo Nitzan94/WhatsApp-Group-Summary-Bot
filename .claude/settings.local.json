@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__firecrawl__firecrawl_search",
+      "mcp__firecrawl__firecrawl_scrape",
+      "Read(/media/**)",
+      "Bash(mkdir:*)",
+      "Bash(npm --version)",
+      "Bash(node:*)",
+      "Bash(npm install)",
+      "WebSearch",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(chmod:*)",
+      "Bash(sqlite3:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(gh repo create:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
