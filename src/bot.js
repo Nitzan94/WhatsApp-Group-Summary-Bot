@@ -21,6 +21,7 @@ const config = require('../config/bot-config');
 const DatabaseManager = require('./database/DatabaseManager');
 const SchedulerService = require('./services/SchedulerService');
 const ConversationHandler = require('./services/ConversationHandler');
+const TaskExecutionService = require('./services/TaskExecutionService');
 const ConfigService = require('./services/ConfigService');
 const WebServer = require('./web/WebServer');
 
@@ -38,7 +39,8 @@ class WhatsAppBot {
     this.phoneNumber = process.env.PHONE_NUMBER || null; // For pairing code authentication
     this.db = new DatabaseManager();
     this.conversationHandler = new ConversationHandler(this.db);
-    this.schedulerService = new SchedulerService(this, this.db, this.conversationHandler);
+    this.taskExecutionService = new TaskExecutionService(this.db, this.conversationHandler, this);
+    this.schedulerService = new SchedulerService(this, this.db, this.conversationHandler, this.taskExecutionService);
     this.summaryTargetGroupId = '972546262108-1556219067@g.us'; // קבוצת "ניצן"
     this.isHistorySyncComplete = false; // Track if initial history sync is done
     
@@ -78,6 +80,10 @@ class WhatsAppBot {
       
       // Initialize database
       await this.db.initialize();
+      
+      // Initialize task execution service
+      await this.taskExecutionService.initialize();
+      logger.info('🚀 TaskExecutionService אותחל בהצלחה');
       
       // Initialize scheduler service
       await this.schedulerService.initialize();

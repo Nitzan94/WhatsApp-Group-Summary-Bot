@@ -504,29 +504,43 @@ class ConfigService extends EventEmitter {
     try {
       let query = `
         SELECT 
-          wt.*,
+          st.*,
           COUNT(te.id) as total_executions,
           COUNT(CASE WHEN te.status = 'completed' THEN 1 END) as successful_executions,
-          MAX(te.executed_at) as last_execution
-        FROM web_tasks wt
-        LEFT JOIN task_executions te ON wt.id = te.task_id
+          MAX(te.executed_at) as last_execution,
+          'scheduled' as task_type
+        FROM scheduled_tasks st
+        LEFT JOIN task_executions te ON st.id = te.task_id
+        WHERE st.active = 1
       `;
       
       const params = [];
-      if (type) {
-        query += ' WHERE wt.task_type = ?';
-        params.push(type);
+      if (type && type === 'scheduled') {
+        // All scheduled_tasks are 'scheduled' type by definition
+        // No additional filter needed
+      } else if (type === 'one_time') {
+        // No one-time tasks in scheduled_tasks, return empty
+        return [];
       }
       
-      query += ' GROUP BY wt.id ORDER BY wt.created_at DESC';
+      query += ' GROUP BY st.id ORDER BY st.created_at DESC';
       
       const tasks = await this.db.allQuery(query, params);
       
-      // Parse JSON fields
+      // Parse JSON fields and adapt format for dashboard
       return tasks.map(task => ({
         ...task,
         target_groups: task.target_groups ? JSON.parse(task.target_groups) : [],
-        next_run: this.calculateNextRun(task)
+        next_run: this.calculateNextRun({
+          ...task,
+          task_type: 'scheduled',
+          cron_expression: task.cron_expression
+        }),
+        // Map scheduled_tasks fields to web_tasks format
+        task_type: 'scheduled',
+        execute_at: null,
+        message_template: task.custom_query,
+        file_path: null
       }));
 
     } catch (error) {
@@ -568,22 +582,23 @@ class ConfigService extends EventEmitter {
         };
       }
 
-      // Insert into database
-      const result = await this.db.runQuery(`
-        INSERT INTO web_tasks (
-          name, task_type, cron_expression, execute_at,
-          action_type, target_groups, message_template, send_to_group
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        name, task_type, cron_expression, execute_at,
-        action_type, JSON.stringify(target_groups || []), 
-        message_template, send_to_group
-      ]);
+      // Insert into scheduled_tasks (Phase 2 unified table)
+      const taskData = {
+        name,
+        description: `Created via dashboard at ${new Date().toLocaleString('he-IL')}`,
+        action_type,
+        target_groups: target_groups || [],
+        cron_expression: task_type === 'scheduled' ? cron_expression : null,
+        execute_at: task_type === 'one_time' ? execute_at : null,
+        custom_query: message_template,
+        send_to_group: send_to_group || 'ניצן',
+        active: 1,
+        created_by: 'dashboard'
+      };
 
-      const taskId = result.lastID;
-
-      // Sync to file system
-      await this.syncTaskToFile(taskId);
+      const taskId = await this.db.createScheduledTask(taskData);
+      
+      // No more file creation - unified database approach only!
 
       logger.info(`Created web task: ${name} (ID: ${taskId})`);
 
@@ -612,18 +627,25 @@ class ConfigService extends EventEmitter {
       const params = [];
       
       // Build dynamic update query
-      const updateableFields = [
-        'name', 'cron_expression', 'execute_at', 'action_type',
-        'target_groups', 'message_template', 'send_to_group', 'active'
-      ];
+      // Map web_tasks field names to scheduled_tasks field names
+      const fieldMapping = {
+        'name': 'name',
+        'cron_expression': 'cron_expression', 
+        'action_type': 'action_type',
+        'target_groups': 'target_groups',
+        'message_template': 'custom_query',
+        'send_to_group': 'send_to_group',
+        'active': 'active'
+      };
 
-      updateableFields.forEach(field => {
-        if (taskData.hasOwnProperty(field)) {
-          updates.push(`${field} = ?`);
-          if (field === 'target_groups') {
-            params.push(JSON.stringify(taskData[field]));
+      Object.keys(fieldMapping).forEach(webField => {
+        const scheduledField = fieldMapping[webField];
+        if (taskData.hasOwnProperty(webField)) {
+          updates.push(`${scheduledField} = ?`);
+          if (webField === 'target_groups') {
+            params.push(JSON.stringify(taskData[webField]));
           } else {
-            params.push(taskData[field]);
+            params.push(taskData[webField]);
           }
         }
       });
@@ -638,13 +660,12 @@ class ConfigService extends EventEmitter {
       params.push(taskId);
 
       await this.db.runQuery(`
-        UPDATE web_tasks 
+        UPDATE scheduled_tasks 
         SET ${updates.join(', ')} 
         WHERE id = ?
       `, params);
 
-      // Sync to file system
-      await this.syncTaskToFile(taskId);
+      // No need to sync to file system - scheduled_tasks handles this
 
       logger.info(`Updated web task: ${taskId}`);
 
@@ -668,29 +689,14 @@ class ConfigService extends EventEmitter {
    */
   async deleteWebTask(taskId) {
     try {
-      // Get task info before deletion
-      const task = await this.db.getQuery(
-        'SELECT file_path FROM web_tasks WHERE id = ?',
-        [taskId]
-      );
-
-      // Delete from database
+      // Delete from scheduled_tasks (no files to clean up)
       const result = await this.db.runQuery(
-        'DELETE FROM web_tasks WHERE id = ?',
+        'DELETE FROM scheduled_tasks WHERE id = ?',
         [taskId]
       );
 
       if (result.changes > 0) {
-        // Delete associated file if exists
-        if (task && task.file_path) {
-          try {
-            await fs.unlink(task.file_path);
-          } catch (fileError) {
-            logger.warn(`Could not delete task file: ${task.file_path}`);
-          }
-        }
-
-        logger.info(`Deleted web task: ${taskId}`);
+        logger.info(`Deleted scheduled task: ${taskId}`);
         return {
           success: true,
           message: 'משימה נמחקה בהצלחה'

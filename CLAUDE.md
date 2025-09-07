@@ -5,10 +5,12 @@
 
 ## 🎯 תכונות עיקריות
 - 🤖 **AI Agent מלא** - שיחה טבעית חכמה עם Claude 3.5 Sonnet
-- 📊 מעקב אחר 122 קבוצות WhatsApp פעילות
-- 🔍 **היסטוריה מלאה** - 75,000+ הודעות משוכפלות מ-WhatsApp Web
+- 📊 מעקב אחר 153 קבוצות WhatsApp פעילות (עודכן!)
+- 🔍 **היסטוריה מלאה** - 89,000+ הודעות משוכפלות מ-WhatsApp Web (עודכן!)
 - 🛠️ **5 כלים חכמים** - DatabaseAgentTools לחיפוש מתקדם
-- ⏰ תזמון אוטומטי (32 קבוצות מתוזמנות)
+- ⏰ **תזמון היברידי** - 6 משימות פעילות (3 מקבצים + 3 ממסד נתונים) 🆕
+- 🌐 **דשבורד ווב** - ניהול משימות דרך http://localhost:5000 🆕
+- 🔄 **TaskExecutionService** - ביצוע משימות מתוזמנות עם AI Agent 🆕
 - 🧹 מחיקת הודעות ישנות אוטומטית (72 שעות)
 - 📈 פקודות חיפוש וניתוח מתקדמות
 - 📊 סטטיסטיקות מפורטות וציר זמן פעילות
@@ -16,18 +18,23 @@
 
 ## 🏗️ ארכיטקטורת המערכת
 
-### 🔑 רכיבי הליבה - AI Agent Architecture
+### 🔑 רכיבי הליבה - AI Agent + Database-Driven Architecture
 ```
 src/
-├── bot.js                          # קובץ ראשי - WhatsApp integration
+├── bot.js                          # קובץ ראשי - WhatsApp integration + Phase 2
 ├── services/
 │   ├── ConversationHandler.js      # 🧠 מנהל ה-AI Agent הראשי
 │   ├── DatabaseAgentTools.js       # 🛠️ 5 כלים חכמים למסד נתונים
-│   ├── SchedulerService.js         # ⏰ מערכת תזמונים
-│   └── SummaryService.js           # 📝 יצירת סיכומים (legacy)
+│   ├── TaskExecutionService.js     # ⚡ ביצוע משימות מתוזמנות (NEW!)
+│   ├── SchedulerService.js         # ⏰ מערכת תזמונים היברידית (ENHANCED!)
+│   ├── SyncManager.js              # 🔄 סנכרון קבצים ↔ מסד נתונים (NEW!)
+│   └── ConfigService.js            # 🛠️ ניהול הגדרות דינמי (NEW!)
 ├── database/
-│   ├── DatabaseManager.js          # 💾 ניהול SQLite מאופטם
-│   └── schema.sql                  # 📋 סכמת הנתונים המלאה
+│   ├── DatabaseManager.js          # 💾 ניהול SQLite + 18 methods חדשים
+│   └── schema.sql                  # 📋 v5.0 - scheduled_tasks + execution_logs
+└── web/
+    ├── WebServer.js                # 🌐 Express.js server (NEW!)
+    └── public/                     # 📱 Dashboard UI files (NEW!)
 ```
 
 ### 🤖 מערכת AI Agent - הליבה החדשה
@@ -304,23 +311,32 @@ node src/bot.js
 - **הגנת פקודות מתקדמות** - רק מקבוצת ניצן
 - **לוגים מוגבלים** - רק metadata, לא תוכן הודעות
 
-## 🎉 גרסה נוכחית: v4.3 - Enhanced Message Sending
+## 🎉 גרסה נוכחית: v5.0 - Database-Driven Task Management (Phase 2)
 
-**תאריך:** 1.9.2025
+**תאריך:** 7.9.2025  
 **מפתח:** ניצן + Claude Code  
-**מצב:** ✅ עובד מושלם - ייצור מלא
+**מצב:** ✅ עובד מושלם - ייצור מלא + דשבורד ווב
 
-### מה חדש ב-v4.3:
-1. **🤖 מערכת AI Agent מלאה** - שיחה טבעית חכמה
-2. **🛠️ 5 כלים מתקדמים** - DatabaseAgentTools מושלם
-3. **🔧 4 תיקונים קריטיים** - database, dates, duplicates, **message sending**
-4. **📊 75,000+ הודעות** - היסטוריה מלאה ועמוקה
-5. **⚡ ביצועים מעולים** - תשובות תוך שניות
-6. **🎯 דיוק גבוה** - 95%+ על חיפושי היסטוריה
-7. **📤 שליחת הודעות מתקדמת** - התאמה מדויקת לקבוצות + הרשאות מורחבות
+### מה חדש ב-v5.0 (Phase 2):
+1. **🔄 TaskExecutionService** - ביצוע משימות מתוזמנות עם AI Agent
+2. **🗄️ מערכת תזמון היברידית** - 6 משימות (3 מקבצים + 3 ממסד נתונים)
+3. **🌐 דשבורד ווב מלא** - http://localhost:5000 לניהול משימות
+4. **📊 מסד נתונים v5.0** - טבלאות scheduled_tasks + task_execution_logs
+5. **🔄 SyncManager** - סנכרון אוטומטי קבצים ↔ מסד נתונים
+6. **⚙️ ConfigService** - ניהול הגדרות דינמי דרך הווב
+7. **🛠️ Context7 Integration** - Agenda.js patterns עם SQLite
+8. **📈 89,000+ הודעות** - בסיס נתונים מתרחב
+9. **📱 153 קבוצות פעילות** - ניטור מתקדם
 
-**המערכת מוכנה לשימוש ייצור מלא! 🚀**
+### תכונות מתקדמות v5.0:
+- **🔗 API מלא**: `/api/status`, `/api/tasks`, `/health`
+- **⏰ תזמון אמין**: Cron jobs עם error handling מתקדם
+- **🔄 תאימות לאחור**: מערכת קבצים ישנה עדיין עובדת
+- **📊 מעקב ביצועים**: Real-time monitoring דרך dashboard
+- **🔒 אבטחה מתקדמת**: ניהול הרשאות ו-API keys
+
+**המערכת מוכנה לשימוש ייצור מלא עם דשבורד ווב! 🚀🌐**
 
 ---
 
-**הערה חשובה:** המידע בקובץ זה מעודכן לגרסה v4.2 ומבוסס על הארכיטקטורה החדשה של AI Agent. לשאלות או בעיות, חפש בלוגים או בדוק את הגיבויים.
+**הערה חשובה:** המידע בקובץ זה מעודכן לגרסה v5.0 ומבוסס על הארכיטקטורה החדשה של AI Agent + Database-Driven Task Management. לפרטים טכניים מלאים על Phase 2, ראה: `new_dashboard/06-phase-2-completion-status.md`

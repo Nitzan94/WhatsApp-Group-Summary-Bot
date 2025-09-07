@@ -1153,6 +1153,445 @@ class DatabaseManager {
   isReady() {
     return this.isInitialized && this.db;
   }
+
+  // ========================================
+  // 🚀 NEW v5.0 METHODS - DB-Driven Scheduler
+  // ========================================
+
+  /**
+   * Create v5.0 tables from schema-v5.sql
+   */
+  async createTablesV5() {
+    try {
+      const schemaV5Path = path.join(__dirname, 'schema-v5.sql');
+      
+      if (!fs.existsSync(schemaV5Path)) {
+        throw new Error(`Schema v5.0 file not found: ${schemaV5Path}`);
+      }
+
+      const schema = fs.readFileSync(schemaV5Path, 'utf8');
+      const statements = this.splitSQLStatements(schema);
+      
+      logger.info('🚀 Creating v5.0 database schema...');
+      
+      for (const statement of statements) {
+        const trimmed = statement.trim();
+        if (trimmed && !trimmed.startsWith('--')) {
+          await this.runQuery(trimmed);
+        }
+      }
+      
+      logger.info('✅ Schema v5.0 created successfully');
+      return true;
+    } catch (error) {
+      logger.error('❌ Failed to create v5.0 schema:', error);
+      throw error;
+    }
+  }
+
+  // ========================================
+  // 📋 SCHEDULED TASKS METHODS
+  // ========================================
+
+  /**
+   * Create a new scheduled task
+   */
+  async createScheduledTask(taskData) {
+    const sql = `
+      INSERT INTO scheduled_tasks (
+        name, description, action_type, target_groups, 
+        cron_expression, custom_query, send_to_group, 
+        active, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    
+    const params = [
+      taskData.name,
+      taskData.description || null,
+      taskData.action_type,
+      JSON.stringify(taskData.target_groups),
+      taskData.cron_expression,
+      taskData.custom_query || null,
+      taskData.send_to_group,
+      taskData.active !== undefined ? taskData.active : true,
+      taskData.created_by || 'system'
+    ];
+
+    try {
+      const result = await this.runQuery(sql, params);
+      logger.info(`✅ Created scheduled task: ${taskData.name} (ID: ${result.lastID})`);
+      return { id: result.lastID, ...taskData };
+    } catch (error) {
+      logger.error('❌ Failed to create scheduled task:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update an existing scheduled task
+   */
+  async updateScheduledTask(taskId, updateData) {
+    const allowedFields = [
+      'name', 'description', 'action_type', 'target_groups',
+      'cron_expression', 'custom_query', 'send_to_group', 'active'
+    ];
+
+    const updates = [];
+    const params = [];
+
+    Object.keys(updateData).forEach(key => {
+      if (allowedFields.includes(key)) {
+        updates.push(`${key} = ?`);
+        if (key === 'target_groups' && Array.isArray(updateData[key])) {
+          params.push(JSON.stringify(updateData[key]));
+        } else {
+          params.push(updateData[key]);
+        }
+      }
+    });
+
+    if (updates.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(taskId);
+
+    const sql = `UPDATE scheduled_tasks SET ${updates.join(', ')} WHERE id = ?`;
+
+    try {
+      const result = await this.runQuery(sql, params);
+      if (result.changes === 0) {
+        throw new Error(`Task with ID ${taskId} not found`);
+      }
+      logger.info(`✅ Updated scheduled task ID: ${taskId}`);
+      return await this.getScheduledTaskById(taskId);
+    } catch (error) {
+      logger.error('❌ Failed to update scheduled task:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all scheduled tasks (active by default)
+   */
+  async getScheduledTasks(activeOnly = true) {
+    const sql = activeOnly 
+      ? 'SELECT * FROM scheduled_tasks WHERE active = 1 ORDER BY next_execution ASC'
+      : 'SELECT * FROM scheduled_tasks ORDER BY created_at DESC';
+
+    try {
+      const tasks = await this.allQuery(sql);
+      return tasks.map(task => ({
+        ...task,
+        target_groups: JSON.parse(task.target_groups || '[]')
+      }));
+    } catch (error) {
+      logger.error('❌ Failed to get scheduled tasks:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get scheduled task by ID
+   */
+  async getScheduledTaskById(taskId) {
+    const sql = 'SELECT * FROM scheduled_tasks WHERE id = ?';
+    
+    try {
+      const task = await this.getQuery(sql, [taskId]);
+      if (!task) return null;
+      
+      return {
+        ...task,
+        target_groups: JSON.parse(task.target_groups || '[]')
+      };
+    } catch (error) {
+      logger.error('❌ Failed to get scheduled task by ID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Delete a scheduled task
+   */
+  async deleteScheduledTask(taskId) {
+    const sql = 'DELETE FROM scheduled_tasks WHERE id = ?';
+    
+    try {
+      const result = await this.runQuery(sql, [taskId]);
+      if (result.changes === 0) {
+        throw new Error(`Task with ID ${taskId} not found`);
+      }
+      logger.info(`✅ Deleted scheduled task ID: ${taskId}`);
+      return true;
+    } catch (error) {
+      logger.error('❌ Failed to delete scheduled task:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update task next execution time
+   */
+  async updateTaskNextExecution(taskId, nextExecutionTime) {
+    const sql = `
+      UPDATE scheduled_tasks 
+      SET next_execution = ?, last_execution = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `;
+    
+    try {
+      await this.runQuery(sql, [nextExecutionTime, taskId]);
+      logger.debug(`Updated next execution for task ${taskId}: ${nextExecutionTime}`);
+    } catch (error) {
+      logger.error('❌ Failed to update task execution time:', error);
+      throw error;
+    }
+  }
+
+  // ========================================
+  // 📊 TASK EXECUTION LOGGING METHODS
+  // ========================================
+
+  /**
+   * Log task execution start
+   */
+  async logTaskExecutionStart(taskId, aiQuery, sessionId = null) {
+    const sql = `
+      INSERT INTO task_execution_logs (
+        task_id, ai_query, session_id, success
+      ) VALUES (?, ?, ?, 0)
+    `;
+    
+    try {
+      const result = await this.runQuery(sql, [taskId, aiQuery, sessionId]);
+      logger.debug(`Started execution log for task ${taskId} (Log ID: ${result.lastID})`);
+      return result.lastID;
+    } catch (error) {
+      logger.error('❌ Failed to log task execution start:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update task execution log with results
+   */
+  async logTaskExecutionEnd(logId, executionData) {
+    const sql = `
+      UPDATE task_execution_logs SET
+        ai_response = ?,
+        ai_model = ?,
+        ai_tokens_used = ?,
+        ai_processing_time = ?,
+        tools_used = ?,
+        tools_data = ?,
+        database_queries = ?,
+        database_results = ?,
+        success = ?,
+        error_message = ?,
+        output_message = ?,
+        output_sent_to = ?,
+        total_execution_time = ?,
+        memory_usage = ?,
+        execution_context = ?,
+        execution_type = ?,
+        groups_processed = ?,
+        messages_analyzed = ?,
+        execution_end = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `;
+
+    const params = [
+      executionData.ai_response || null,
+      executionData.ai_model || 'claude-3.5-sonnet',
+      executionData.ai_tokens_used || 0,
+      executionData.ai_processing_time || 0,
+      executionData.tools_used ? JSON.stringify(executionData.tools_used) : null,
+      executionData.tools_data ? JSON.stringify(executionData.tools_data) : null,
+      executionData.database_queries || 0,
+      executionData.database_results || 0,
+      executionData.success || false,
+      executionData.error_message || null,
+      executionData.output_message || null,
+      executionData.output_sent_to || null,
+      executionData.total_execution_time || 0,
+      executionData.memory_usage || 0,
+      executionData.execution_context ? JSON.stringify(executionData.execution_context) : null,
+      executionData.execution_type || 'scheduled',
+      executionData.groups_processed || 0,
+      executionData.messages_analyzed || 0,
+      logId
+    ];
+
+    try {
+      await this.runQuery(sql, params);
+      logger.debug(`Completed execution log ID: ${logId}`);
+      return true;
+    } catch (error) {
+      logger.error('❌ Failed to log task execution end:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get task execution logs
+   */
+  async getTaskExecutionLogs(taskId, limit = 50) {
+    const sql = `
+      SELECT tel.*, st.name as task_name
+      FROM task_execution_logs tel
+      JOIN scheduled_tasks st ON tel.task_id = st.id
+      WHERE tel.task_id = ?
+      ORDER BY tel.execution_start DESC
+      LIMIT ?
+    `;
+
+    try {
+      const logs = await this.allQuery(sql, [taskId, limit]);
+      return logs.map(log => ({
+        ...log,
+        tools_used: log.tools_used ? JSON.parse(log.tools_used) : null,
+        tools_data: log.tools_data ? JSON.parse(log.tools_data) : null,
+        execution_context: log.execution_context ? JSON.parse(log.execution_context) : null
+      }));
+    } catch (error) {
+      logger.error('❌ Failed to get task execution logs:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get execution statistics
+   */
+  async getExecutionStats(days = 30) {
+    const sql = `
+      SELECT 
+        COUNT(*) as total_executions,
+        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_executions,
+        SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed_executions,
+        AVG(total_execution_time) as avg_execution_time,
+        AVG(ai_tokens_used) as avg_tokens_used,
+        SUM(messages_analyzed) as total_messages_analyzed,
+        SUM(groups_processed) as total_groups_processed
+      FROM task_execution_logs 
+      WHERE execution_start >= datetime('now', '-${days} days')
+    `;
+
+    try {
+      const stats = await this.getQuery(sql);
+      return {
+        total_executions: stats?.total_executions || 0,
+        successful_executions: stats?.successful_executions || 0,
+        failed_executions: stats?.failed_executions || 0,
+        success_rate: stats?.total_executions > 0 
+          ? ((stats.successful_executions / stats.total_executions) * 100).toFixed(2)
+          : '0.00',
+        avg_execution_time: Math.round(stats?.avg_execution_time || 0),
+        avg_tokens_used: Math.round(stats?.avg_tokens_used || 0),
+        total_messages_analyzed: stats?.total_messages_analyzed || 0,
+        total_groups_processed: stats?.total_groups_processed || 0
+      };
+    } catch (error) {
+      logger.error('❌ Failed to get execution stats:', error);
+      return null;
+    }
+  }
+
+  // ========================================
+  // 🔄 MIGRATION HELPER METHODS  
+  // ========================================
+
+  /**
+   * Check if v5.0 tables exist
+   */
+  async hasV5Tables() {
+    const sql = `
+      SELECT name FROM sqlite_master 
+      WHERE type='table' AND name IN ('scheduled_tasks', 'task_execution_logs')
+    `;
+    
+    try {
+      const tables = await this.allQuery(sql);
+      return tables.length === 2;
+    } catch (error) {
+      logger.error('❌ Failed to check v5.0 tables:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Migrate data from text files to database
+   * Called from migration script
+   */
+  async migrateFromTextFiles(schedulesData) {
+    try {
+      logger.info('🔄 Starting migration from text files to database...');
+      
+      const migratedTasks = [];
+      
+      for (const schedule of schedulesData) {
+        try {
+          const taskData = {
+            name: schedule.name || `Task-${Date.now()}`,
+            description: schedule.description || 'Migrated from text file',
+            action_type: this.mapLegacyActionType(schedule.action),
+            target_groups: schedule.groups || [],
+            cron_expression: this.convertScheduleToCron(schedule.schedule),
+            send_to_group: schedule.send_to || 'ניצן',
+            active: true,
+            created_by: 'migration'
+          };
+
+          const created = await this.createScheduledTask(taskData);
+          migratedTasks.push(created);
+          
+        } catch (taskError) {
+          logger.error(`Failed to migrate schedule: ${schedule.name}`, taskError);
+        }
+      }
+      
+      logger.info(`✅ Migration completed: ${migratedTasks.length} tasks migrated`);
+      return migratedTasks;
+      
+    } catch (error) {
+      logger.error('❌ Migration failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Map legacy action types to v5.0 types
+   */
+  mapLegacyActionType(legacyAction) {
+    const mapping = {
+      'daily_summary': 'daily_summary',
+      'latest_message': 'latest_message',  // This stays as is for compatibility
+      'summary': 'daily_summary',
+      'today': 'today_summary'
+    };
+    
+    return mapping[legacyAction] || 'daily_summary';
+  }
+
+  /**
+   * Convert legacy schedule format to cron
+   */
+  convertScheduleToCron(scheduleText) {
+    if (!scheduleText) return '0 16 * * *'; // Default: daily at 4 PM
+    
+    // Parse common patterns
+    if (scheduleText.includes('every day at')) {
+      const timeMatch = scheduleText.match(/(\d{1,2}):(\d{2})/);
+      if (timeMatch) {
+        const [, hour, minute] = timeMatch;
+        return `${minute} ${hour} * * *`;
+      }
+    }
+    
+    // Default fallback
+    return '0 16 * * *';
+  }
 }
 
 module.exports = DatabaseManager;

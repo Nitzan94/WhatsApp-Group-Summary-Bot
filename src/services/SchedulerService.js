@@ -20,16 +20,19 @@ const {
 } = require('../utils/schedulerLogger');
 
 class SchedulerService {
-  constructor(bot, db, conversationHandler = null) {
+  constructor(bot, db, conversationHandler = null, taskExecutionService = null) {
     this.bot = bot;
     this.db = db;
     this.conversationHandler = conversationHandler;
+    this.taskExecutionService = taskExecutionService;
     this.activeCronJobs = new Map(); // Map of schedule id -> cron job
     this.scheduleParser = new ScheduleParser();
     this.schedules = [];
     this.schedulesPath = path.join(__dirname, '../../schedules');
     this.isInitialized = false;
     this.fileWatcher = null;
+    this.dbScheduledTasks = []; // Database-driven tasks
+    this.dbTaskJobs = new Map(); // Map of DB task ID -> cron job
   }
 
   /**
@@ -44,8 +47,15 @@ class SchedulerService {
         logger.warn('⚠️ ConversationHandler לא זמין - סיכומים מתוזמנים לא יעבדו');
       }
       
-      // Load schedules from files
+      // Load schedules from files (legacy system)
       await this.loadSchedulesFromFiles();
+      
+      // Load scheduled tasks from database (new v5.0 system)
+      if (this.taskExecutionService) {
+        await this.loadScheduledTasksFromDB();
+      } else {
+        logger.warn('⚠️ TaskExecutionService לא זמין - משימות מתוזמנות מהמסד נתונים לא יטענו');
+      }
       
       // Set up file watching for hot reload
       this.setupFileWatching();
@@ -54,7 +64,8 @@ class SchedulerService {
       // await this.scheduleDailyCleanup();
       
       this.isInitialized = true;
-      logger.info(`✅ מערכת תזמונים חדשה הופעלה - ${this.schedules.length} תזמונים נטענו`);
+      const totalSchedules = this.schedules.length + this.dbScheduledTasks.length;
+      logger.info(`✅ מערכת תזמונים חדשה הופעלה - ${this.schedules.length} תזמונים מקבצים + ${this.dbScheduledTasks.length} משימות מהמסד נתונים = ${totalSchedules} סה"כ`);
       
     } catch (error) {
       logger.error('Failed to initialize scheduler:', error);
@@ -210,6 +221,126 @@ class SchedulerService {
     } catch (error) {
       logger.error('Failed to load schedules from files:', error);
       this.schedules = [];
+    }
+  }
+
+  /**
+   * Load scheduled tasks from database (v5.0 system)
+   */
+  async loadScheduledTasksFromDB() {
+    try {
+      logger.info('🗄️ טוען משימות מתוזמנות מהמסד נתונים...');
+      
+      // Get active scheduled tasks from database
+      const tasks = await this.db.getScheduledTasks(true); // activeOnly = true
+      this.dbScheduledTasks = tasks;
+      
+      logger.info(`📋 נמצאו ${tasks.length} משימות פעילות במסד הנתונים`);
+      
+      // Stop existing DB task jobs
+      this.stopAllDBTaskJobs();
+      
+      // Create cron jobs for each database task
+      let activeDBJobs = 0;
+      for (const task of tasks) {
+        if (await this.createDBTaskCronJob(task)) {
+          activeDBJobs++;
+        }
+      }
+      
+      logger.info(`✅ נטענו ${tasks.length} משימות מתוזמנות, ${activeDBJobs} פעילות`);
+      
+    } catch (error) {
+      logger.error('❌ Failed to load scheduled tasks from database:', error);
+      this.dbScheduledTasks = [];
+    }
+  }
+
+  /**
+   * Create cron job for database-driven task
+   */
+  async createDBTaskCronJob(task) {
+    try {
+      const { id, name, cron_expression, active } = task;
+      
+      if (!active) {
+        logger.debug(`⏭️ משימה ${id} (${name}) לא פעילה, מדלג`);
+        return false;
+      }
+
+      if (!cron.validate(cron_expression)) {
+        logger.warn(`⚠️ ביטוי cron לא תקין עבור משימה ${id}: ${cron_expression}`);
+        return false;
+      }
+
+      logger.info(`⏰ יוצר תזמון עבור משימה: ${name} (${cron_expression})`);
+
+      const job = cron.schedule(cron_expression, async () => {
+        const sessionId = generateSchedulerSessionId();
+        logSchedulerManagement('database_task_execution', {
+          taskId: id,
+          taskName: name,
+          sessionId,
+          cronExpression: cron_expression
+        });
+
+        try {
+          // Execute via TaskExecutionService
+          const result = await this.taskExecutionService.executeScheduledTask(id);
+          
+          if (result.success) {
+            logger.info(`✅ [DB TASK] משימה ${id} (${name}) בוצעה בהצלחה`);
+          } else {
+            logger.error(`❌ [DB TASK] משימה ${id} (${name}) נכשלה: ${result.error || 'Unknown error'}`);
+          }
+        } catch (error) {
+          logger.error(`❌ [DB TASK] שגיאה בביצוע משימה ${id}:`, error);
+        }
+      }, {
+        scheduled: false, // Don't start immediately
+        timezone: 'Asia/Jerusalem'
+      });
+
+      // Store job reference
+      this.dbTaskJobs.set(id, job);
+      
+      // Start the job
+      job.start();
+      
+      logger.debug(`✅ תזמון נוצר ופעל עבור משימה ${id} (${name})`);
+      return true;
+
+    } catch (error) {
+      logger.error(`❌ Failed to create cron job for DB task ${task.id}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Stop all database task cron jobs
+   */
+  stopAllDBTaskJobs() {
+    for (const [taskId, job] of this.dbTaskJobs) {
+      try {
+        job.stop();
+        logger.debug(`⏹️ עצר תזמון עבור משימה ${taskId}`);
+      } catch (error) {
+        logger.warn(`⚠️ Failed to stop DB task job ${taskId}:`, error);
+      }
+    }
+    this.dbTaskJobs.clear();
+  }
+
+  /**
+   * Reload database tasks (for web dashboard updates)
+   */
+  async reloadDatabaseTasks() {
+    try {
+      logger.info('🔄 מעדכן משימות מתוזמנות מהמסד נתונים...');
+      await this.loadScheduledTasksFromDB();
+      logger.info('✅ עדכון משימות מתוזמנות הושלם');
+    } catch (error) {
+      logger.error('❌ Failed to reload database tasks:', error);
     }
   }
 
@@ -541,6 +672,7 @@ class SchedulerService {
    * Stop all active cron jobs
    */
   stopAllJobs() {
+    // Stop file-based schedule jobs
     for (const [id, job] of this.activeCronJobs) {
       try {
         job.stop();
@@ -549,7 +681,11 @@ class SchedulerService {
       }
     }
     this.activeCronJobs.clear();
-    logger.info('⏰ כל התזמונים הופסקו');
+    
+    // Stop database task jobs
+    this.stopAllDBTaskJobs();
+    
+    logger.info('⏰ כל התזמונים הופסקו (קבצים + מסד נתונים)');
   }
 
   /**
