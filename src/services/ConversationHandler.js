@@ -516,7 +516,21 @@ class ConversationHandler {
           
           try {
             logger.info(`🛠️ [AI AGENT] Executing tool: ${name}`);
-            const parsedArgs = JSON.parse(args);
+            
+            // 🔧 SENIOR ENGINEER FIX: Validate args before JSON.parse
+            let parsedArgs;
+            if (!args || args.trim() === '') {
+              logger.warn(`⚠️ [AI AGENT] Empty args for tool ${name}, using empty object`);
+              parsedArgs = {};
+            } else {
+              try {
+                parsedArgs = JSON.parse(args);
+              } catch (parseError) {
+                logger.error(`❌ [AI AGENT] JSON parse failed for tool ${name}, args: "${args}"`, parseError);
+                throw new Error(`Invalid JSON arguments: ${args}`);
+              }
+            }
+            
             const toolResult = await this.dbTools.executeTool(name, parsedArgs);
             const toolExecutionTime = Date.now() - toolStartTime;
             
@@ -539,12 +553,20 @@ class ConversationHandler {
             const toolExecutionTime = Date.now() - toolStartTime;
             logger.error(`Error executing tool ${name}:`, error);
             
+            // 🔧 SENIOR ENGINEER FIX: Safe JSON parsing for error logging
+            let safeArgs = {};
+            try {
+              safeArgs = args && args.trim() ? JSON.parse(args) : {};
+            } catch {
+              safeArgs = { raw_args: args }; // Keep raw args if parsing fails
+            }
+            
             // Log failed tool execution (existing system)
-            logToolExecution(context.sessionId, name, JSON.parse(args || '{}'), { error: error.message }, toolExecutionTime);
+            logToolExecution(context.sessionId, name, safeArgs, { error: error.message }, toolExecutionTime);
             
             // Log failed tool usage (new detailed system)
             if (requestSessionId) {
-              logToolUsage(requestSessionId, name, JSON.parse(args || '{}'), { error: error.message }, toolExecutionTime);
+              logToolUsage(requestSessionId, name, safeArgs, { error: error.message }, toolExecutionTime);
             }
             
             messages.push({

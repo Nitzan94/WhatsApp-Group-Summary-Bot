@@ -175,17 +175,57 @@ class TasksComponent {
             ${type === 'scheduled' ? `
               <div>
                 <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  תזמון (CRON)
+                  תדירות
                 </label>
-                <select id="task-cron" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
-                                               bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
-                  <option value="0 18 * * *">כל יום ב-18:00</option>
-                  <option value="0 16 * * *">כל יום ב-16:00</option>
-                  <option value="0 9 * * *">כל יום ב-09:00</option>
-                  <option value="0 21 * * *">כל יום ב-21:00</option>
-                  <option value="0 10 * * 0">כל יום ראשון ב-10:00</option>
-                  <option value="custom">מותאם אישית...</option>
+                <select id="task-frequency" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                               bg-white dark:bg-gray-700 text-gray-900 dark:text-white mb-2"
+                                               onchange="window.tasksComponent.updateFrequency(this.value)">
+                  <option value="daily">כל יום</option>
+                  <option value="weekly">כל שבוע</option>
+                  <option value="monthly">כל חודש</option>
+                  <option value="custom">מותאם אישית</option>
                 </select>
+                
+                <div id="time-picker-container">
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">שעה</label>
+                  <input type="time" id="task-time" value="16:00"
+                         class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                </div>
+                
+                <div id="weekly-picker-container" style="display: none;">
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">יום בשבוע</label>
+                  <select id="task-weekday" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                                  bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                    <option value="0">ראשון</option>
+                    <option value="1">שני</option>
+                    <option value="2">שלישי</option>
+                    <option value="3">רביעי</option>
+                    <option value="4">חמישי</option>
+                    <option value="5">שישי</option>
+                    <option value="6">שבת</option>
+                  </select>
+                </div>
+                
+                <div id="monthly-picker-container" style="display: none;">
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">יום בחודש</label>
+                  <input type="number" id="task-monthday" value="1" min="1" max="31"
+                         class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                </div>
+                
+                <div id="custom-cron-container" style="display: none;">
+                  <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">ביטוי CRON</label>
+                  <input type="text" id="task-cron-custom" 
+                         class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                         placeholder="דוגמה: 0 16 * * * (כל יום ב-16:00)">
+                  <div class="text-xs text-gray-500 mt-1">
+                    דוגמאות: <code>0 16 * * *</code> (יומי 16:00), <code>0 9 * * 1</code> (שני 09:00)
+                  </div>
+                </div>
+                
+                <div id="next-execution-preview" class="text-xs text-blue-600 dark:text-blue-400 mt-2"></div>
               </div>
             ` : `
               <div>
@@ -203,12 +243,29 @@ class TasksComponent {
                 סוג פעולה
               </label>
               <select id="task-action" class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
-                                              bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                                              bg-white dark:bg-gray-700 text-gray-900 dark:text-white mb-2"
+                                              onchange="window.tasksComponent.toggleCustomFields(this.value)">
                 <option value="daily_summary">סיכום יומי</option>
-                <option value="today_summary">סיכום היום</option>
                 <option value="weekly_summary">סיכום שבועי</option>
-                <option value="send_message">שליחת הודעה</option>
+                <option value="send_message">שליחת הודעה לקבוצה</option>
+                <option value="custom_query">טקסט חופשי</option>
               </select>
+              
+              <div id="send-message-container" style="display: none;">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">תוכן ההודעה</label>
+                <textarea id="task-message-text" rows="3"
+                         class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                         placeholder="כתוב את תוכן ההודעה כאן..."></textarea>
+              </div>
+              
+              <div id="custom-text-container" style="display: none;">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">פעולה מותאמת</label>
+                <textarea id="task-custom-text" rows="3"
+                         class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md 
+                                bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                         placeholder="תאר בעברית מה אתה רוצה שהבוט יעשה..."></textarea>
+              </div>
             </div>
             
             <div>
@@ -258,6 +315,14 @@ class TasksComponent {
       .filter(t => t);
     const send_to_group = document.getElementById('task-send-to').value.trim();
     
+    // Get message/custom text based on action type
+    let message_template = '';
+    if (action_type === 'send_message') {
+      message_template = document.getElementById('task-message-text')?.value || '';
+    } else if (action_type === 'custom_query') {
+      message_template = document.getElementById('task-custom-text')?.value || '';
+    }
+    
     if (!name) {
       this.showToast('נא להזין שם למשימה', 'error');
       return;
@@ -268,25 +333,32 @@ class TasksComponent {
       task_type: type,
       action_type,
       target_groups: targets,
-      send_to_group: send_to_group || 'ניצן'
+      send_to_group: send_to_group || 'ניצן',
+      message_template: message_template
     };
 
     if (type === 'scheduled') {
-      taskData.cron_expression = document.getElementById('task-cron').value;
-      if (taskData.cron_expression === 'custom') {
-        this.showToast('נא להזין ביטוי CRON מותאם אישית', 'error');
+      taskData.cron_expression = this.buildCronExpression();
+      console.log('🕐 buildCronExpression returned:', taskData.cron_expression);
+      if (!taskData.cron_expression) {
+        console.error('❌ Cron expression is empty!');
+        this.showToast('שגיאה בביטוי התזמון', 'error');
         return;
       }
     } else {
       taskData.execute_at = document.getElementById('task-datetime').value;
+      console.log('📅 execute_at value:', taskData.execute_at);
       if (!taskData.execute_at) {
+        console.error('❌ Execute_at is empty!');
         this.showToast('נא לבחור תאריך ושעה', 'error');
         return;
       }
     }
 
     try {
+      console.log('🚀 Frontend sending taskData to API:', JSON.stringify(taskData, null, 2));
       const response = await window.API.createTask(taskData);
+      console.log('📨 API response:', response);
       if (response.success) {
         this.showToast(response.message || 'המשימה נוצרה בהצלחה', 'success');
         this.closeModal();
@@ -412,6 +484,111 @@ class TasksComponent {
       "'": '&#39;'
     };
     return text.replace(/[&<>"']/g, m => map[m]);
+  }
+
+  // New functions for enhanced task creation
+  updateFrequency(frequency) {
+    const weeklyContainer = document.getElementById('weekly-picker-container');
+    const monthlyContainer = document.getElementById('monthly-picker-container');
+    const customContainer = document.getElementById('custom-cron-container');
+    
+    // Hide all special containers
+    weeklyContainer.style.display = 'none';
+    monthlyContainer.style.display = 'none';
+    customContainer.style.display = 'none';
+    
+    // Show relevant container
+    switch (frequency) {
+      case 'weekly':
+        weeklyContainer.style.display = 'block';
+        break;
+      case 'monthly':
+        monthlyContainer.style.display = 'block';
+        break;
+      case 'custom':
+        customContainer.style.display = 'block';
+        break;
+    }
+    
+    this.updateExecutionPreview();
+  }
+
+  toggleCustomFields(actionType) {
+    const messageContainer = document.getElementById('send-message-container');
+    const customContainer = document.getElementById('custom-text-container');
+    
+    // Hide all containers
+    messageContainer.style.display = 'none';
+    customContainer.style.display = 'none';
+    
+    // Show relevant container
+    switch (actionType) {
+      case 'send_message':
+        messageContainer.style.display = 'block';
+        break;
+      case 'custom_query':
+        customContainer.style.display = 'block';
+        break;
+    }
+  }
+
+  buildCronExpression() {
+    const frequency = document.getElementById('task-frequency').value;
+    const time = document.getElementById('task-time').value;
+    
+    if (!time) return null;
+    
+    const [hour, minute] = time.split(':');
+    
+    switch (frequency) {
+      case 'daily':
+        return `${minute} ${hour} * * *`;
+      case 'weekly':
+        const weekday = document.getElementById('task-weekday').value;
+        return `${minute} ${hour} * * ${weekday}`;
+      case 'monthly':
+        const monthday = document.getElementById('task-monthday').value;
+        return `${minute} ${hour} ${monthday} * *`;
+      case 'custom':
+        return document.getElementById('task-cron-custom').value.trim();
+      default:
+        return null;
+    }
+  }
+
+  updateExecutionPreview() {
+    const cronExpression = this.buildCronExpression();
+    const previewDiv = document.getElementById('next-execution-preview');
+    
+    if (!cronExpression) {
+      previewDiv.textContent = '';
+      return;
+    }
+    
+    // Simple preview - you could enhance this with a proper cron parser
+    const frequency = document.getElementById('task-frequency').value;
+    const time = document.getElementById('task-time').value;
+    
+    let preview = '';
+    switch (frequency) {
+      case 'daily':
+        preview = `יבוצע מדי יום ב-${time}`;
+        break;
+      case 'weekly':
+        const weekdays = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+        const weekday = document.getElementById('task-weekday').value;
+        preview = `יבוצע כל יום ${weekdays[weekday]} ב-${time}`;
+        break;
+      case 'monthly':
+        const monthday = document.getElementById('task-monthday').value;
+        preview = `יבוצע כל ${monthday} לחודש ב-${time}`;
+        break;
+      case 'custom':
+        preview = `CRON: ${cronExpression}`;
+        break;
+    }
+    
+    previewDiv.textContent = preview;
   }
   
   destroy() {

@@ -25,7 +25,7 @@ const {
   generateSchedulerSessionId
 } = require('../utils/schedulerLogger');
 
-class SchedulerService {
+class SchedulerServiceFixed {
   constructor(bot, db, conversationHandler = null, taskExecutionService = null) {
     this.bot = bot;
     this.db = db;
@@ -233,40 +233,18 @@ class SchedulerService {
         return true;
       }
       
-      // 🔧 SENIOR ENGINEER FIX: Check if task should execute based on cron schedule
+      // Check if enough time has passed since last execution
       const lastExecTime = new Date(lastExecution);
       const timeSinceLastExec = currentTime - lastExecTime;
+      const oneHourMs = 60 * 60 * 1000;
       
-      // Calculate expected execution intervals based on cron pattern
-      const twoMinutesMs = 2 * 60 * 1000;  // Prevent duplicate executions in same window
-      const oneDayMs = 24 * 60 * 60 * 1000;  // Daily tasks
-      
-      // For cron expressions, determine minimum interval between executions
-      let minimumInterval = twoMinutesMs;  // Default: 2 minutes to prevent duplicates
-      
-      // If this is a daily task (specific hour/minute, * for day/month/weekday)
-      if (minute !== '*' && hour !== '*' && dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
-        minimumInterval = oneDayMs - (30 * 60 * 1000);  // 23.5 hours for daily tasks
-        logger.debug(`📅 [SCHEDULE LOGIC] Daily task detected, minimum interval: 23.5 hours`);
-      }
-      // If this is a weekly task (specific day of week)
-      else if (dayOfWeek !== '*') {
-        minimumInterval = 6 * oneDayMs;  // 6 days for weekly tasks
-        logger.debug(`📅 [SCHEDULE LOGIC] Weekly task detected, minimum interval: 6 days`);
-      }
-      // If this is a monthly task (specific day of month)
-      else if (dayOfMonth !== '*') {
-        minimumInterval = 25 * oneDayMs;  // 25 days for monthly tasks
-        logger.debug(`📅 [SCHEDULE LOGIC] Monthly task detected, minimum interval: 25 days`);
-      }
-      
-      // Execute if enough time has passed for this type of schedule
-      if (timeSinceLastExec >= minimumInterval) {
-        logger.info(`⏰ [SCHEDULE LOGIC] זמן ביצוע הגיע! (${Math.round(timeSinceLastExec / (60 * 1000))} דקות מהביצוע האחרון)`);
+      // Only execute if more than 1 hour has passed (prevents multiple executions in the same minute)
+      if (timeSinceLastExec > oneHourMs) {
+        logger.info(`⏰ [SCHEDULE LOGIC] עבר יותר משעה מהביצוע האחרון, מבצע עכשיו`);
         return true;
       }
       
-      logger.debug(`⏭️ [SCHEDULE LOGIC] עדיין לא הגיע הזמן (צריך לחכות עוד ${Math.round((minimumInterval - timeSinceLastExec) / (60 * 1000))} דקות)`);
+      logger.debug(`⏭️ [SCHEDULE LOGIC] עדיין לא הגיע הזמן (ביצוע אחרון לפני ${Math.round(timeSinceLastExec / (60 * 1000))} דקות)`);
       return false;
       
     } catch (error) {
@@ -430,4 +408,4 @@ class SchedulerService {
   }
 }
 
-module.exports = SchedulerService;
+module.exports = SchedulerServiceFixed;

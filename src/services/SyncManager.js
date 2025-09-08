@@ -26,17 +26,14 @@ class SyncManager extends EventEmitter {
     try {
       logger.info('🔄 Initializing SyncManager...');
       
-      // First, sync all files to database
-      await this.syncFilesToDatabase();
-      
-      // Start watching for file changes
-      this.startFileWatcher();
+      // Skip file sync since we're using database only
+      logger.info('📊 Using database-only mode - skipping file sync');
       
       // Set up event listeners for database changes
       this.setupDatabaseChangeListeners();
       
       this.isInitialized = true;
-      logger.info('✅ SyncManager initialized successfully');
+      logger.info('✅ SyncManager initialized successfully (database-only mode)');
       
       return true;
     } catch (error) {

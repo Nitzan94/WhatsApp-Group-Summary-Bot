@@ -511,7 +511,7 @@ class ConfigService extends EventEmitter {
           'scheduled' as task_type
         FROM scheduled_tasks st
         LEFT JOIN task_executions te ON st.id = te.task_id
-        WHERE st.active = 1
+        WHERE 1=1
       `;
       
       const params = [];
@@ -554,6 +554,8 @@ class ConfigService extends EventEmitter {
    */
   async createWebTask(taskData) {
     try {
+      logger.info('🔍 CreateWebTask received data:', JSON.stringify(taskData, null, 2));
+      
       const {
         name, task_type, cron_expression, execute_at,
         action_type, target_groups, message_template, send_to_group
@@ -561,9 +563,11 @@ class ConfigService extends EventEmitter {
 
       // Validate required fields
       if (!name || !task_type || !action_type) {
+        logger.error('❌ Missing required fields:', { name, task_type, action_type });
         return {
           success: false,
-          error: 'Missing required fields'
+          error: 'Missing required fields',
+          message: `חסרים שדות חובה: name=${!!name}, task_type=${!!task_type}, action_type=${!!action_type}`
         };
       }
 
@@ -583,20 +587,20 @@ class ConfigService extends EventEmitter {
       }
 
       // Insert into scheduled_tasks (Phase 2 unified table)
-      const taskData = {
+      const scheduledTaskData = {
         name,
         description: `Created via dashboard at ${new Date().toLocaleString('he-IL')}`,
         action_type,
         target_groups: target_groups || [],
         cron_expression: task_type === 'scheduled' ? cron_expression : null,
-        execute_at: task_type === 'one_time' ? execute_at : null,
         custom_query: message_template,
         send_to_group: send_to_group || 'ניצן',
         active: 1,
         created_by: 'dashboard'
       };
 
-      const taskId = await this.db.createScheduledTask(taskData);
+      const result = await this.db.createScheduledTask(scheduledTaskData);
+      const taskId = result.id;
       
       // No more file creation - unified database approach only!
 

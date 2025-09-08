@@ -108,7 +108,17 @@ class WhatsAppBot {
       const { version } = await fetchLatestBaileysVersion();
       logger.info(`🔧 גרסת Baileys: ${version}`);
 
-      await this.createConnection();
+      // Try WhatsApp connection but don't crash if it fails
+      try {
+        await this.createConnection();
+      } catch (whatsappError) {
+        logger.error('⚠️ WhatsApp connection failed, but bot services will continue:', whatsappError.message);
+        logger.info('📊 Dashboard and scheduler are still running');
+        // Keep the process alive for dashboard and scheduler
+        setInterval(() => {
+          logger.debug('🔄 Bot services running (no WhatsApp)');
+        }, 60000); // Log every minute
+      }
     } catch (error) {
       logger.error('Failed to initialize bot:', error);
       process.exit(1);
@@ -119,11 +129,28 @@ class WhatsAppBot {
    * Create WhatsApp connection with authentication
    */
   async createConnection() {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        logger.warn('⏰ WhatsApp connection timeout, but continuing...');
+        resolve(); // Resolve instead of reject to continue
+      }, 45000); // 45 second timeout
+
+      try {
+        this.connectWithRetry(resolve, reject, timeout);
+      } catch (error) {
+        clearTimeout(timeout);
+        logger.error('❌ Connection setup failed:', error.message);
+        resolve(); // Don't crash, just continue
+      }
+    });
+  }
+
+  async connectWithRetry(resolve, reject, timeout) {
     try {
       // Load auth state from session files
       const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
       
-      // Create socket connection
+      // Create socket connection with error handling
       this.socket = makeWASocket({
         auth: state,
         printQRInTerminal: false, // We'll handle QR ourselves
@@ -135,16 +162,30 @@ class WhatsAppBot {
         // Enhanced configuration for full history sync
         emitOwnEvents: false,
         generateHighQualityLinkPreview: false,
-        maxMsgRetryCount: 5,
-        msgRetryCounterMap: {}
+        maxMsgRetryCount: 3, // Reduced retries to fail faster
+        msgRetryCounterMap: {},
+        // Add connection options to handle errors better
+        connectTimeoutMs: 30000,
+        connectCooldownMs: 5000
+      });
+
+      // Add global error handler for socket
+      this.socket.ev.on('error', (error) => {
+        logger.error('⚠️ WhatsApp Socket Error:', error.message);
+        // Don't crash on socket errors
       });
 
       // Handle authentication updates
       this.socket.ev.on('creds.update', saveCreds);
 
-      // Handle connection updates
+      // Handle connection updates with error protection
       this.socket.ev.on('connection.update', (update) => {
-        this.handleConnectionUpdate(update);
+        try {
+          this.handleConnectionUpdate(update, resolve, timeout);
+        } catch (error) {
+          logger.error('❌ Connection update error:', error.message);
+          // Don't crash, continue
+        }
       });
 
       // Handle messages (will expand this later)
@@ -173,15 +214,17 @@ class WhatsAppBot {
       });
 
     } catch (error) {
-      logger.error('Failed to create connection:', error);
-      throw error;
+      clearTimeout(timeout);
+      logger.error('Failed to create connection:', error.message);
+      logger.warn('⚠️ WhatsApp connection failed, but services will continue');
+      resolve(); // Don't crash, just continue without WhatsApp
     }
   }
 
   /**
    * Handle connection state updates
    */
-  async handleConnectionUpdate(update) {
+  async handleConnectionUpdate(update, resolve = null, timeout = null) {
     const { connection, lastDisconnect, qr } = update;
 
     // Handle authentication based on configured method
@@ -207,7 +250,9 @@ class WhatsAppBot {
       this.handleDisconnection(lastDisconnect);
     } else if (connection === 'open') {
       logger.info('🔗 Connection is open, calling handleSuccessfulConnection');
+      if (timeout) clearTimeout(timeout);
       this.handleSuccessfulConnection();
+      if (resolve) resolve(); // Resolve the connection promise
     } else if (connection === 'connecting') {
       logger.info('🔄 מתחבר לWhatsApp...');
     }
@@ -550,6 +595,42 @@ class WhatsAppBot {
     const messageContent = message.message?.[messageType];
     let content = '';
     
+    // 🔥 SAFETY CHECK - handle cases where messageType is undefined
+    if (!messageType) {
+      logger.warn(`⚠️ No message type found for message:`, JSON.stringify(message, null, 2));
+      content = '[הודעה ללא סוג]';
+      
+      // Save as is with unknown type
+      const senderName = message.pushName || (message.key.participant || message.key.remoteJid).split('@')[0];
+      await this.db.saveMessage({
+        group_id: groupId,
+        message_id: messageId,
+        sender_id: senderId,
+        sender_name: senderName,
+        content,
+        timestamp: new Date(message.messageTimestamp * 1000).toISOString(),
+        message_type: 'unknown'
+      });
+      return;
+    }
+    
+    // 🔥 DEBUG - בואי נראה מה בדיוק מגיע (expanded for all groups showing [undefined])
+    const debugGroups = [
+      '972546262108-1556219067@g.us', // ניצן
+      '120363417758222119@g.us',      // Nitzan bot
+      '120363417919003634@g.us',      // Ron.Kav Hub  
+      '120363400630794167@g.us',      // הקהילה
+      '120363040426958814@g.us',      // המוקד 462
+      '120363144406735324@g.us',      // רמתשרונים🍓-קבוצת העיר
+      '972528910743-1437583145@g.us'  // משפחה של לולה
+    ];
+    
+    if (debugGroups.includes(groupId)) {
+      logger.info(`🔍 CONTENT DEBUG for ${groupId}:`);
+      logger.info(`📝 Message Type: ${messageType}`);
+      logger.info(`📦 Message Content:`, JSON.stringify(messageContent, null, 2));
+    }
+    
     switch (messageType) {
       case 'conversation':
         content = messageContent;
@@ -569,8 +650,70 @@ class WhatsAppBot {
       case 'audioMessage':
         content = '[הודעה קולית]';
         break;
+      case 'stickerMessage':
+        content = '[מדבקה]';
+        break;
+      case 'reactionMessage':
+        content = `[תגובה: ${messageContent?.text || ''}]`;
+        break;
+      case 'protocolMessage':
+        // הודעות מחיקה או שינוי
+        if (messageContent?.type === 0) {
+          content = '[הודעה נמחקה]';
+        } else {
+          content = `[הודעת פרוטוקול: ${messageContent?.type}]`;
+        }
+        break;
+      case 'ephemeralMessage':
+        // הודעות נעלמות
+        const ephemeralContent = messageContent?.message;
+        const ephemeralType = Object.keys(ephemeralContent || {})[0];
+        if (ephemeralType === 'conversation') {
+          content = ephemeralContent[ephemeralType];
+        } else if (ephemeralType === 'extendedTextMessage') {
+          content = ephemeralContent[ephemeralType]?.text || '';
+        } else {
+          content = `[הודעה נעלמת: ${ephemeralType}]`;
+        }
+        break;
+      case 'senderKeyDistributionMessage':
+        // הודעות חלוקת מפתחות - לא צריך לשמור תוכן
+        content = '[מפתח הצפנה]';
+        break;
+      case 'viewOnceMessage':
+        // הודעות חד פעמיות
+        const viewOnceContent = messageContent?.message;
+        const viewOnceType = Object.keys(viewOnceContent || {})[0];
+        if (viewOnceType === 'imageMessage') {
+          content = '[תמונה חד פעמית]';
+        } else if (viewOnceType === 'videoMessage') {
+          content = '[וידאו חד פעמי]';
+        } else {
+          content = `[הודעה חד פעמית: ${viewOnceType}]`;
+        }
+        break;
+      case 'contactMessage':
+        content = `[איש קשר: ${messageContent?.displayName || 'לא ידוע'}]`;
+        break;
+      case 'locationMessage':
+        content = '[מיקום]';
+        break;
+      case 'liveLocationMessage':
+        content = '[מיקום בזמן אמת]';
+        break;
+      case 'pollCreationMessage':
+        content = `[סקר: ${messageContent?.name || 'ללא כותרת'}]`;
+        break;
+      case 'pollUpdateMessage':
+        content = '[עדכון סקר]';
+        break;
       default:
         content = `[${messageType}]`;
+    }
+    
+    // 🔥 DEBUG - תוצאה סופית
+    if (debugGroups.includes(groupId)) {
+      logger.info(`✅ Final content: "${content}"`);
     }
     
     // Get sender name (try to get pushName or use ID)
@@ -810,11 +953,11 @@ class WhatsAppBot {
     try {
       // Send notification to admin group about successful sync
       if (this.summaryTargetGroupId) {
-        const totalMessages = await this.db.getAllQuery(
+        const totalMessages = await this.db.allQuery(
           'SELECT COUNT(*) as count FROM messages'
         );
         
-        const totalGroups = await this.db.getAllQuery(
+        const totalGroups = await this.db.allQuery(
           'SELECT COUNT(*) as count FROM groups WHERE is_active = 1'
         );
         
@@ -3469,10 +3612,32 @@ module.exports = WhatsAppBot;
 
 // Start the bot if this file is run directly
 if (require.main === module) {
+  // Add global error handlers to prevent crashes
+  process.on('uncaughtException', (error) => {
+    logger.error('🔴 Uncaught Exception:', error);
+    // Don't exit - keep running
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    logger.error('🔴 Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't exit - keep running
+  });
+
+  process.on('warning', (warning) => {
+    logger.warn('⚠️ Process Warning:', warning.message);
+  });
+
   console.log('📱 Initializing WhatsApp Bot...');
   const bot = new WhatsAppBot();
   bot.initialize().catch(error => {
     logger.error('Failed to start bot:', error);
-    process.exit(1);
+    // Try to restart after 5 seconds instead of exiting
+    setTimeout(() => {
+      logger.info('🔄 Attempting to restart bot...');
+      bot.initialize().catch(restartError => {
+        logger.error('❌ Failed to restart:', restartError.message);
+        process.exit(1);
+      });
+    }, 5000);
   });
 }

@@ -14,7 +14,7 @@ class WebServer {
     this.configService = configService;
     this.app = express();
     this.server = null;
-    this.port = process.env.WEB_PORT || 3000;
+    this.port = process.env.WEB_PORT || 3001;
     this.startTime = Date.now();
 
     this.setupMiddleware();
@@ -287,11 +287,14 @@ class WebServer {
 
     apiRouter.post('/tasks', async (req, res) => {
       try {
+        logger.info('🔍 WebServer received POST /tasks:', JSON.stringify(req.body, null, 2));
         const result = await this.configService.createWebTask(req.body);
+        logger.info('📝 ConfigService returned:', JSON.stringify(result, null, 2));
         
         if (result.success) {
           res.status(201).json(result);
         } else {
+          logger.warn('❌ Task creation failed, returning 400:', result.message || result.error);
           res.status(400).json(result);
         }
       } catch (error) {

@@ -166,18 +166,20 @@ class TaskExecutionService {
   async executeViaAI(task, aiQuery, sessionId) {
     const aiStartTime = Date.now();
     
+    // Create execution context for AI (outside try-catch so it's available in catch)
+    const context = this.buildExecutionContext(task, sessionId);
+    
     try {
       logger.info(`🧠 [AI AGENT] Processing query for task ${task.id}`);
 
-      // Create execution context for AI
-      const context = this.buildExecutionContext(task, sessionId);
-
       // Call ConversationHandler (existing AI Agent system)
-      const aiResponse = await this.conversationHandler.handleMessage(
+      const aiResponse = await this.conversationHandler.processNaturalQuery(
         aiQuery,
         context.groupId, // Use send_to_group as context
-        'scheduled-task', // Message type
-        context // Additional context
+        'scheduled-task', // User type
+        true, // forceGroupQuery
+        'system', // userId
+        'TaskExecutionService' // userName
       );
 
       const aiProcessingTime = Date.now() - aiStartTime;

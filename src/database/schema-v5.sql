@@ -100,6 +100,33 @@ CREATE TABLE IF NOT EXISTS task_execution_logs (
 );
 
 -- ========================================
+-- 💬 טבלת שיחות AI Agent
+-- ========================================
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  
+  -- 📝 מידע בסיסי  
+  group_id TEXT NOT NULL,
+  group_name TEXT,
+  user_message TEXT NOT NULL,
+  bot_response TEXT,
+  
+  -- 🤖 AI Agent מטאדטה
+  ai_model TEXT DEFAULT 'claude-3.5-sonnet',
+  tools_used TEXT, -- JSON array של כלים שנעשה בהם שימוש
+  processing_time INTEGER DEFAULT 0, -- במילישניות
+  tokens_used INTEGER DEFAULT 0,
+  
+  -- ⏰ זמנים
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  -- 📊 סטטוס
+  success BOOLEAN DEFAULT 1,
+  error_message TEXT
+);
+
+-- ========================================
 -- 🚀 אינדקסים לביצועים מיטביים
 -- ========================================
 
