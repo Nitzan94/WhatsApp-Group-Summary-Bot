@@ -209,6 +209,97 @@ class WebServer {
       }
     });
 
+    // ===== Initial Setup & Available Groups =====
+    
+    // Check if initial setup is needed
+    apiRouter.get('/setup/status', async (req, res) => {
+      try {
+        const groups = await this.configService.getManagementGroups();
+        const needsSetup = groups.length === 0;
+        
+        res.json({
+          success: true,
+          data: {
+            needsSetup,
+            managementGroupsCount: groups.length,
+            hasConfiguration: !needsSetup
+          }
+        });
+      } catch (error) {
+        logger.error('Failed to check setup status:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to check setup status'
+        });
+      }
+    });
+
+    // Get available groups for setup
+    apiRouter.get('/setup/groups', async (req, res) => {
+      try {
+        const groups = await this.db.allQuery(`
+          SELECT g.id, g.name, COUNT(m.id) as message_count, g.is_active
+          FROM groups g 
+          LEFT JOIN messages m ON g.id = m.group_id
+          WHERE g.is_active = 1
+          GROUP BY g.id, g.name 
+          ORDER BY message_count DESC
+          LIMIT 20
+        `);
+        
+        res.json({
+          success: true,
+          data: groups || []
+        });
+      } catch (error) {
+        logger.error('Failed to get available groups:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to get available groups'
+        });
+      }
+    });
+
+    // Complete initial setup
+    apiRouter.post('/setup/complete', async (req, res) => {
+      try {
+        const { selectedGroupName } = req.body;
+        
+        if (!selectedGroupName) {
+          return res.status(400).json({
+            success: false,
+            error: 'Missing selected group name',
+            message: 'שם הקבוצה הנבחרת חסר'
+          });
+        }
+
+        // Add the selected group as management group
+        const result = await this.configService.addManagementGroup(selectedGroupName);
+        
+        if (result.success) {
+          logger.info(`Initial setup completed with group: ${selectedGroupName}`);
+          res.json({
+            success: true,
+            message: 'הגדרה ראשונית הושלמה בהצלחה',
+            data: {
+              managementGroup: result.group,
+              setupCompleted: true
+            }
+          });
+        } else {
+          res.status(400).json(result);
+        }
+
+      } catch (error) {
+        logger.error('Failed to complete initial setup:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Failed to complete setup',
+          message: 'שגיאה בהשלמת ההגדרה הראשונית'
+        });
+      }
+    });
+
     // ===== API Key Management =====
     
     apiRouter.get('/config/api-key', async (req, res) => {

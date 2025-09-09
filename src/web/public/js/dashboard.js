@@ -8,7 +8,21 @@ class Dashboard {
       // Show loading overlay
       this.showLoading(true);
 
-      // Initialize all components
+      // Setup global utilities first
+      this.setupToastNotifications();
+      this.setupGlobalErrorHandling();
+
+      // Check if initial setup is needed
+      this.components.setup = new window.SetupComponent();
+      const needsSetup = await this.components.setup.initialize();
+      
+      if (needsSetup) {
+        // Setup wizard is showing, don't initialize other components yet
+        this.showLoading(false);
+        return;
+      }
+
+      // Initialize all components for normal operation
       this.components.status = new window.StatusComponent();
       this.components.groups = new window.GroupsComponent();
       this.components.tasks = new window.TasksComponent();
@@ -27,10 +41,6 @@ class Dashboard {
         this.components.tasks.initialize(),
         this.components.config.initialize()
       ]);
-
-      // Setup global utilities
-      this.setupToastNotifications();
-      this.setupGlobalErrorHandling();
 
       console.log('Dashboard initialized successfully');
     } catch (error) {
@@ -109,6 +119,35 @@ class Dashboard {
           </div>
         </div>
       `;
+    }
+  }
+
+  async refresh() {
+    // Refresh all initialized components
+    const refreshPromises = [];
+    
+    if (this.components.status && this.components.status.refresh) {
+      refreshPromises.push(this.components.status.refresh());
+    }
+    
+    if (this.components.groups && this.components.groups.refresh) {
+      refreshPromises.push(this.components.groups.refresh());
+    }
+    
+    if (this.components.tasks && this.components.tasks.refresh) {
+      refreshPromises.push(this.components.tasks.refresh());
+    }
+    
+    if (this.components.config && this.components.config.refresh) {
+      refreshPromises.push(this.components.config.refresh());
+    }
+    
+    try {
+      await Promise.all(refreshPromises);
+      console.log('Dashboard refreshed successfully');
+    } catch (error) {
+      console.error('Failed to refresh dashboard:', error);
+      window.showToast('שגיאה ברענון הדשבורד', 'error');
     }
   }
 

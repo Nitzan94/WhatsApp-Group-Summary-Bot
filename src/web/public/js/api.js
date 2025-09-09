@@ -74,6 +74,23 @@ class API {
     });
   }
 
+  // Initial Setup & Available Groups endpoints
+  async getSetupStatus() {
+    return this.request('/setup/status');
+  }
+  
+  async getAvailableGroups() {
+    const response = await this.request('/setup/groups');
+    return response.data || [];
+  }
+  
+  async completeSetup(selectedGroupName) {
+    return this.request('/setup/complete', {
+      method: 'POST',
+      body: JSON.stringify({ selectedGroupName })
+    });
+  }
+
   // API Key endpoints
   async getApiKeyStatus() {
     return this.request('/config/api-key');
