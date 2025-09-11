@@ -440,17 +440,29 @@ class WebServer {
       try {
         const { id } = req.params;
         
-        // TODO: Implement task execution
-        res.json({
-          success: true,
-          message: 'Task execution initiated',
-          taskId: id
-        });
+        // Execute task via TaskExecutionService
+        if (this.bot.taskExecutionService) {
+          logger.info(`🔧 [MANUAL] Manual execution requested for task ${id} via API`);
+          const result = await this.bot.taskExecutionService.executeManually(id, 'web-api');
+          
+          res.json({
+            success: true,
+            message: 'Task execution completed',
+            taskId: id,
+            result: result
+          });
+        } else {
+          res.status(503).json({
+            success: false,
+            error: 'TaskExecutionService not available'
+          });
+        }
       } catch (error) {
         logger.error('Failed to execute task:', error);
         res.status(500).json({
           success: false,
-          error: 'Failed to execute task'
+          error: 'Failed to execute task',
+          message: error.message
         });
       }
     });

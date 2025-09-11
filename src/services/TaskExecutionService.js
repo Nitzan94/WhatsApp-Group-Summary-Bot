@@ -90,6 +90,26 @@ class TaskExecutionService {
       // Execute via ConversationHandler (AI Agent)
       const executionResult = await this.executeViaAI(task, aiQuery, sessionId);
 
+      // Check if AI execution failed
+      if (!executionResult.success) {
+        // Log execution failure
+        await this.logExecutionEnd(executionLogId, executionResult, startTime);
+        
+        // Remove from execution queue
+        this.executionQueue.delete(sessionId);
+        
+        logger.error(`❌ [EXECUTION] Task ${taskId} failed during AI processing: ${executionResult.error_message}`);
+        
+        return {
+          success: false,
+          error: executionResult.error_message,
+          sessionId,
+          taskId,
+          executionTime: Date.now() - startTime,
+          result: executionResult
+        };
+      }
+
       // Log execution completion
       await this.logExecutionEnd(executionLogId, executionResult, startTime);
 
@@ -154,7 +174,10 @@ class TaskExecutionService {
       
       'latest_message': `מה ההודעות האחרונות מהקבוצות הבאות: ${target_groups.join(', ')}? תציג את העדכונים הכי חדשים.`,
       
-      'group_analytics': `תן לי ניתוח פעילות מתקדם עבור הקבוצות: ${target_groups.join(', ')}. כלול סטטיסטיקות ומגמות.`
+      'group_analytics': `תן לי ניתוח פעילות מתקדם עבור הקבוצות: ${target_groups.join(', ')}. כלול סטטיסטיקות ומגמות.`,
+      
+      // 🆕 Support for send_message action type - מה שקפטן ביקש!
+      'send_message': `${custom_query || `שלח הודעה לקבוצת ${target_groups[0]}`}. השתמש ב-send_message_to_group tool לשלוח את ההודעה בפועל.`
     };
 
     return queryTemplates[action_type] || queryTemplates['daily_summary'];
@@ -384,10 +407,10 @@ class TaskExecutionService {
    * Health check
    */
   isHealthy() {
-    return this.isInitialized && 
+    return !!(this.isInitialized && 
            this.db && this.db.isReady() &&
            this.conversationHandler &&
-           this.bot;
+           this.bot);
   }
 }
 

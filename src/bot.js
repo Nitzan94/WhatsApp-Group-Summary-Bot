@@ -1577,6 +1577,35 @@ class WhatsAppBot {
   }
 
   /**
+   * Send message to group by name (for TaskExecutionService)
+   * @param {string} groupName - Name of the group to send to
+   * @param {string} message - Message to send
+   */
+  async sendMessageToGroup(groupName, message) {
+    try {
+      // Find group by name
+      const groups = await this.searchGroupsByName(groupName);
+      
+      if (groups.length === 0) {
+        logger.error(`❌ [SEND] Group "${groupName}" not found`);
+        return false;
+      }
+      
+      // Use the first matching group (most active)
+      const targetGroup = groups[0];
+      
+      // Send message using socket
+      await this.socket.sendMessage(targetGroup.id, { text: message });
+      logger.info(`📤 [SEND] Message sent to group: ${groupName} (${targetGroup.id})`);
+      return true;
+      
+    } catch (error) {
+      logger.error(`❌ [SEND] Failed to send message to ${groupName}:`, error);
+      return false;
+    }
+  }
+
+  /**
    * Handle remote today summary command from ניצן group
    */
   async handleRemoteTodaySummary(message, groupName) {
